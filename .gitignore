@@ -1,0 +1,9 @@
+.env
+phase6_session.txt
+gold_signal_bot.session
+__pycache__/
+*.pyc
+phase6_executed_signals.json
+phase6_pending_signals.json
+phase6_signal_lifecycle.json
+phase6_trade_log.json

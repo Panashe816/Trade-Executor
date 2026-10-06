@@ -1,0 +1,4 @@
+aiohttp
+python-dotenv
+telethon
+metaapi-cloud-sdk
