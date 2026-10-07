@@ -89,9 +89,11 @@ TELEGRAM_BOT_TOKEN = os.getenv(
     ""
 )
 
+PHASE6_STATUS_CHAT_ID = os.getenv("PHASE6_STATUS_CHAT_ID", "")
+
 TELEGRAM_NOTIFICATION_CHAT_ID = os.getenv(
     "TELEGRAM_NOTIFICATION_CHAT_ID",
-    str(PHASE4_OUTPUT_CHANNEL_ID)
+    ""
 )
 
 
@@ -202,8 +204,12 @@ connection = None
 
 watch_tasks = {}
 
-# Telegram client used for status/trade notifications in the Phase 4 channel
+# Telegram client used for Phase 6 private status/trade notifications.
 telegram_client = None
+
+signal_status_report_times = {}
+STATUS_HEARTBEAT_SECONDS = 60
+SIGNAL_STATUS_REPORT_SECONDS = 30
 
 # MetaApi connection state tracking
 metaapi_connection_state = "UNKNOWN"
@@ -1527,37 +1533,28 @@ async def send_notification(
     message
 ):
 
-    # Prefer the same Telethon user session so notifications are written
-    # directly into the Phase 4 private output channel.
+    # Phase 4 is READ-ONLY input for Phase 6.
+    # Diagnostics/trade notifications go only to the separate private
+    # status chat configured with PHASE6_STATUS_CHAT_ID.
     global telegram_client
 
-    if telegram_client is not None:
+    target_chat = str(PHASE6_STATUS_CHAT_ID).strip()
 
+    if telegram_client is not None and target_chat:
         try:
-
             await telegram_client.send_message(
-                PHASE4_OUTPUT_CHANNEL_ID,
+                int(target_chat),
                 message
             )
-
-            return
-
+            return True
         except Exception as error:
-
             print(
-                "⚠️ Telegram channel notification failed: "
-                f"{error}"
+                "⚠️ Phase 6 private Telegram notification failed: "
+                f"{type(error).__name__}: {error}"
             )
 
-    # Keep the existing bot fallback for environments where the Telethon
-    # session is not yet available.
-    if not TELEGRAM_BOT_TOKEN:
-
-        return
-
-    if not TELEGRAM_NOTIFICATION_CHAT_ID:
-
-        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_NOTIFICATION_CHAT_ID:
+        return False
 
     url = (
         "https://api.telegram.org/"
@@ -1565,36 +1562,26 @@ async def send_notification(
         "sendMessage"
     )
 
-    payload = {
-        "chat_id": TELEGRAM_NOTIFICATION_CHAT_ID,
-        "text": message,
-    }
-
     try:
-
         async with aiohttp.ClientSession() as session:
-
             async with session.post(
                 url,
-                json=payload,
+                json={
+                    "chat_id": TELEGRAM_NOTIFICATION_CHAT_ID,
+                    "text": message,
+                },
                 timeout=15
             ) as response:
-
                 if response.status != 200:
-
-                    body = await response.text()
-                    print(
-                        "⚠️ Telegram notification failed:"
-                    )
-                    print(body)
-
+                    print(await response.text())
+                    return False
+                return True
     except Exception as error:
-
         print(
             "⚠️ Telegram notification failed: "
-            f"{error}"
+            f"{type(error).__name__}: {error}"
         )
-
+        return False
 
 
 # ============================================================
@@ -2157,6 +2144,35 @@ async def execute_signal(
             print(f"   Connection obj:  {type(connection).__name__}")
             print(f"   Connection state: {metaapi_connection_state}")
 
+            await send_notification(
+                "🔬 METAAPI ORDER DIAGNOSTICS
+
+"
+                f"Signal ID: {signal['signal_id']}
+"
+                f"Position: {position_number}/{POSITIONS_PER_SIGNAL}
+"
+                f"Direction: {direction}
+"
+                f"Symbol: {SYMBOL}
+"
+                f"Volume: {LOT_SIZE}
+"
+                f"SL: {signal['stoploss']}
+"
+                f"TP{tp_number}: {tp_price}
+"
+                f"Execution price: {execution_price:.3f}
+"
+                f"Comment: {marker}
+"
+                f"Client ID: {client_id}
+"
+                f"Connection state: {metaapi_connection_state}
+"
+                "Checking account and live quote before order."
+            )
+
             # Verify the account state immediately before sending.
             try:
                 print("   🔎 Checking MetaApi account information...")
@@ -2196,6 +2212,29 @@ async def execute_signal(
             print("   Waiting up to 30 seconds for MetaApi response...")
             print("   ==================================================")
 
+            await send_notification(
+                "📤 METAAPI ORDER REQUEST SENT
+
+"
+                f"Signal ID: {signal['signal_id']}
+"
+                f"Position: {position_number}/{POSITIONS_PER_SIGNAL}
+"
+                f"Direction: {direction}
+"
+                f"Symbol: {SYMBOL}
+"
+                f"Volume: {LOT_SIZE}
+"
+                f"SL: {signal['stoploss']}
+"
+                f"TP{tp_number}: {tp_price}
+"
+                f"Execution price: {execution_price:.3f}
+"
+                "Waiting up to 30 seconds for MetaApi response."
+            )
+
             order_started = datetime.now(timezone.utc)
 
             try:
@@ -2228,6 +2267,23 @@ async def execute_signal(
                 print(f"   Response time: {elapsed:.3f} seconds")
                 print(f"   Response type: {type(result).__name__}")
                 print(f"   Raw response:  {result!r}")
+
+                await send_notification(
+                    "📨 METAAPI ORDER RESPONSE RECEIVED
+
+"
+                    f"Signal ID: {signal['signal_id']}
+"
+                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}
+"
+                    f"Response time: {elapsed:.3f}s
+"
+                    f"Result code: {get_field(result, 'stringCode', 'UNKNOWN')}
+"
+                    f"Position ID: {get_field(result, 'positionId', get_field(result, 'position_id', 'UNKNOWN'))}
+"
+                    f"Raw result: {result!r}"
+                )
 
             except asyncio.TimeoutError:
                 elapsed = (datetime.now(timezone.utc) - order_started).total_seconds()
@@ -2275,6 +2331,21 @@ async def execute_signal(
                 print(f"   Exception type: {type(order_error).__name__}")
                 print(f"   Exception: {order_error}")
 
+                await send_notification(
+                    "❌ METAAPI ORDER REQUEST FAILED
+
+"
+                    f"Signal ID: {signal['signal_id']}
+"
+                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}
+"
+                    f"Exception type: {type(order_error).__name__}
+"
+                    f"Exception: {order_error}
+"
+                    f"Details: {getattr(order_error, 'details', None)!r}"
+                )
+
                 # MetaApi ValidationException instances can contain the
                 # broker/API reason in `details`. Print it explicitly so a
                 # future rejection is diagnosable without guessing.
@@ -2286,7 +2357,7 @@ async def execute_signal(
                 # client. Use it when available, but never let diagnostics
                 # hide the original exception.
                 try:
-                    formatter = getattr(api, "format_error", None)
+                    formatter = getattr(metaapi, "format_error", None)
                     if callable(formatter):
                         print("   Formatted MetaApi error:")
                         print(f"      {formatter(order_error)}")
@@ -2725,6 +2796,46 @@ async def wait_for_entry(
                 print(f"   Current execution price: {execution_price:.3f}")
                 print(f"   Required range: {extended_low:.3f} - {extended_high:.3f}")
                 print("   Decision: WAIT — no trade will be sent yet.")
+
+                last_report = signal_status_report_times.get(signal_id)
+                now_timestamp = now_utc().timestamp()
+
+                if (
+                    last_report is None
+                    or now_timestamp - last_report >= SIGNAL_STATUS_REPORT_SECONDS
+                ):
+                    signal_status_report_times[signal_id] = now_timestamp
+
+                    await send_notification(
+                        "🔄 ENTRY WATCHER HEARTBEAT
+
+"
+                        f"Signal ID: {signal_id}
+"
+                        f"Time: {format_cat_time(now_iso())}
+"
+                        f"Direction: {signal['direction']}
+"
+                        f"Bid: {bid:.3f}
+"
+                        f"Ask: {ask:.3f}
+"
+                        f"Execution price: {execution_price:.3f}
+"
+                        f"Original range: {signal['entry_low']:.3f} - {signal['entry_high']:.3f}
+"
+                        f"Extended range: {extended_low:.3f} - {extended_high:.3f}
+"
+                        f"Inside original: {'YES' if inside_original else 'NO'}
+"
+                        f"Inside extended: {'YES' if inside_extended else 'NO'}
+"
+                        f"MetaApi state: {metaapi_connection_state}
+"
+                        f"Valid until: {format_cat_time(signal['valid_until'])}
+"
+                        "Decision: WAIT — no order has been sent."
+                    )
 
                 if not signal.get("waiting_notification_sent", False):
                     await notify_signal_waiting(
@@ -3623,6 +3734,17 @@ async def handle_message(
             print("   The message was received, but read_phase4_execution_message() returned None.")
             print("   No trade attempt was made.")
             print("   Check that Phase 4 sent the expected execution fields.")
+
+            await send_notification(
+                "❌ PHASE 6 COULD NOT READ PHASE 4 MESSAGE
+
+"
+                f"Message ID: {message_id}
+"
+                "No trade attempt was made.
+"
+                "Reason: read_phase4_execution_message() returned None."
+            )
             return
 
         print()
@@ -3634,6 +3756,27 @@ async def handle_message(
         print(f"   Execution TPs: {signal.get('execution_tps')}")
         print(f"   TP numbers: {signal.get('execution_tp_numbers')}")
         print(f"   Valid Until: {format_cat_time(signal.get('valid_until'))}")
+
+        await send_notification(
+            "✅ PHASE 6 READ PHASE 4 EXECUTION DATA
+
+"
+            f"Signal ID: {signal.get('signal_id')}
+"
+            f"Direction: {signal.get('direction')}
+"
+            f"Entry: {signal.get('entry_low')} - {signal.get('entry_high')}
+"
+            f"SL: {signal.get('stoploss')}
+"
+            f"Execution TPs: {signal.get('execution_tps')}
+"
+            f"TP numbers: {signal.get('execution_tp_numbers')}
+"
+            f"Valid until: {format_cat_time(signal.get('valid_until'))}
+"
+            f"Telegram message ID: {message_id}"
+        )
 
         signal_id = signal[
             "signal_id"
@@ -3747,6 +3890,23 @@ async def handle_message(
         print(f"   Extended range: {extended_low:.3f} - {extended_high:.3f}")
         print(f"   Extension: {ENTRY_EXTENSION_PRICE:.3f} price units")
 
+        await send_notification(
+            "📐 EXECUTION RANGE CALCULATED
+
+"
+            f"Signal ID: {signal_id}
+"
+            f"Direction: {signal['direction']}
+"
+            f"Original entry: {signal['entry_low']:.3f} - {signal['entry_high']:.3f}
+"
+            f"Allowed range: {extended_low:.3f} - {extended_high:.3f}
+"
+            f"Extension: {ENTRY_EXTENSION_PRICE:.3f}
+"
+            f"Valid until: {format_cat_time(signal['valid_until'])}"
+        )
+
         signal[
             "status"
         ] = "WAITING"
@@ -3797,6 +3957,25 @@ async def handle_message(
         print(f"   Allowed range: {extended_low:.3f} - {extended_high:.3f}")
         print(f"   Valid until: {format_cat_time(signal['valid_until'])}")
         print("   Checking price every 2 seconds.")
+
+        await send_notification(
+            "🟡 ENTRY WATCHER STARTED
+
+"
+            f"Signal ID: {signal_id}
+"
+            f"Symbol: {SYMBOL}
+"
+            f"Direction: {signal['direction']}
+"
+            f"Allowed range: {extended_low:.3f} - {extended_high:.3f}
+"
+            f"Valid until: {format_cat_time(signal['valid_until'])}
+"
+            "Price checks: every 2 seconds
+"
+            "Telegram market heartbeat: every 30 seconds."
+        )
 
     except Exception as error:
 
@@ -3979,8 +4158,61 @@ def display_settings():
     )
 
     print(
-        "  • Telegram status notifications: Phase 4 channel"
+        "  • Telegram INPUT: Phase 4 channel (read-only)"
     )
+    print(
+        "  • Telegram STATUS: separate private channel"
+    )
+    print(
+        f"  • Status chat ID: {PHASE6_STATUS_CHAT_ID or 'NOT CONFIGURED'}"
+    )
+    print(
+        "  • Detailed background diagnostics: ON"
+    )
+
+
+# ============================================================
+# PRIVATE TELEGRAM STATUS HEARTBEAT
+# ============================================================
+
+async def status_heartbeat():
+
+    while True:
+        try:
+            active_watchers = sum(
+                1 for task in watch_tasks.values()
+                if task is not None and not task.done()
+            )
+
+            await send_notification(
+                "💓 PHASE 6 HEARTBEAT
+
+"
+                f"Time: {format_cat_time(now_iso())}
+"
+                f"MetaApi: {metaapi_connection_state}
+"
+                f"Symbol: {SYMBOL}
+"
+                f"Active watchers: {active_watchers}
+"
+                f"Pending signals: {len(pending_signals)}
+"
+                f"Executed signals in memory: {len(executed_signals)}
+"
+                "Telegram listener: ACTIVE
+"
+                "Worker: ALIVE"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(
+                "⚠️ Status heartbeat failed: "
+                f"{type(error).__name__}: {error}"
+            )
+
+        await asyncio.sleep(STATUS_HEARTBEAT_SECONDS)
 
 
 # ============================================================
@@ -4460,6 +4692,22 @@ async def main():
                 event.raw_text or ""
             )
 
+            await send_notification(
+                "📥 PHASE 4 MESSAGE RECEIVED
+
+"
+                f"Time: {format_cat_time(now_iso())}
+"
+                f"Message ID: {event.message.id}
+"
+                f"Chat ID: {event_chat_id}
+
+"
+                "Raw message:
+"
+                f"{event.raw_text or '[EMPTY]'}"
+            )
+
             # Run processing separately so MetaApi operations and
             # notifications never block Telegram's update loop.
             asyncio.create_task(
@@ -4498,6 +4746,10 @@ async def main():
         metaapi_connection_monitor()
     )
 
+    status_heartbeat_task = asyncio.create_task(
+        status_heartbeat()
+    )
+
     # --------------------------------------------------------
     # RESUME PENDING / OPEN POSITIONS
     # --------------------------------------------------------
@@ -4528,12 +4780,32 @@ async def main():
         "Press CTRL+C to stop."
     )
 
+    if not PHASE6_STATUS_CHAT_ID:
+        print(
+            "⚠️ PHASE6_STATUS_CHAT_ID is not configured. "
+            "Configure the separate private status channel before deployment."
+        )
+
     await send_notification(
-        "🟢 PHASE 6 DEMO EXECUTOR ONLINE\n\n"
-        f"MetaApi connection: {metaapi_connection_state}\n"
-        f"MT5 symbol: {SYMBOL}\n"
-        f"Phase 4 channel: {PHASE4_OUTPUT_CHANNEL_ID}\n"
-        "Connection recovery, pending-signal protection, duplicate protection and post-trade verification are active.\n"
+        "🟢 PHASE 6 DEMO EXECUTOR ONLINE
+
+"
+        f"Time: {format_cat_time(now_iso())}
+"
+        f"MetaApi connection: {metaapi_connection_state}
+"
+        f"MT5 symbol: {SYMBOL}
+"
+        f"Lot size: {LOT_SIZE} x {POSITIONS_PER_SIGNAL} positions
+"
+        f"Phase 4 INPUT channel: {PHASE4_OUTPUT_CHANNEL_ID}
+"
+        f"Phase 6 STATUS channel: {PHASE6_STATUS_CHAT_ID or 'NOT CONFIGURED'}
+"
+        "Telegram listener: ACTIVE
+"
+        "Detailed diagnostics: ACTIVE
+"
         "⚠️ DEMO ONLY"
     )
 
@@ -4552,6 +4824,8 @@ async def main():
         daily_report_task.cancel()
 
         metaapi_monitor_task.cancel()
+
+        status_heartbeat_task.cancel()
 
         for task in list(
             watch_tasks.values()
