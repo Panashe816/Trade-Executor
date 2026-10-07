@@ -89,7 +89,10 @@ TELEGRAM_BOT_TOKEN = os.getenv(
     ""
 )
 
-PHASE6_STATUS_CHAT_ID = os.getenv("PHASE6_STATUS_CHAT_ID", "")
+PHASE6_STATUS_CHAT_ID = os.getenv(
+    "PHASE6_STATUS_CHAT_ID",
+    ""
+)
 
 TELEGRAM_NOTIFICATION_CHAT_ID = os.getenv(
     "TELEGRAM_NOTIFICATION_CHAT_ID",
@@ -1534,8 +1537,8 @@ async def send_notification(
 ):
 
     # Phase 4 is READ-ONLY input for Phase 6.
-    # Diagnostics/trade notifications go only to the separate private
-    # status chat configured with PHASE6_STATUS_CHAT_ID.
+    # Diagnostics/trade notifications go to the separate private
+    # Phase 6 status channel.
     global telegram_client
 
     target_chat = str(PHASE6_STATUS_CHAT_ID).strip()
@@ -1562,18 +1565,22 @@ async def send_notification(
         "sendMessage"
     )
 
+    payload = {
+        "chat_id": TELEGRAM_NOTIFICATION_CHAT_ID,
+        "text": message,
+    }
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url,
-                json={
-                    "chat_id": TELEGRAM_NOTIFICATION_CHAT_ID,
-                    "text": message,
-                },
+                json=payload,
                 timeout=15
             ) as response:
                 if response.status != 200:
-                    print(await response.text())
+                    body = await response.text()
+                    print("⚠️ Telegram notification failed:")
+                    print(body)
                     return False
                 return True
     except Exception as error:
@@ -2097,6 +2104,15 @@ async def execute_signal(
                     existing
                 )
                 positions.append(record)
+
+                await send_notification(
+                    "🛡️ EXISTING POSITION FOUND - NO DUPLICATE ORDER\n\n"
+                    f"Signal ID: {signal['signal_id']}\n"
+                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
+                    f"TP{tp_number}: {tp_price}\n"
+                    f"Existing position: {existing}"
+                )
+
                 continue
 
         except Exception as error:
@@ -2145,31 +2161,18 @@ async def execute_signal(
             print(f"   Connection state: {metaapi_connection_state}")
 
             await send_notification(
-                "🔬 METAAPI ORDER DIAGNOSTICS
-
-"
-                f"Signal ID: {signal['signal_id']}
-"
-                f"Position: {position_number}/{POSITIONS_PER_SIGNAL}
-"
-                f"Direction: {direction}
-"
-                f"Symbol: {SYMBOL}
-"
-                f"Volume: {LOT_SIZE}
-"
-                f"SL: {signal['stoploss']}
-"
-                f"TP{tp_number}: {tp_price}
-"
-                f"Execution price: {execution_price:.3f}
-"
-                f"Comment: {marker}
-"
-                f"Client ID: {client_id}
-"
-                f"Connection state: {metaapi_connection_state}
-"
+                "🔬 METAAPI ORDER DIAGNOSTICS\n\n"
+                f"Signal ID: {signal['signal_id']}\n"
+                f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
+                f"Direction: {direction}\n"
+                f"Symbol: {SYMBOL}\n"
+                f"Volume: {LOT_SIZE}\n"
+                f"SL: {signal['stoploss']}\n"
+                f"TP{tp_number}: {tp_price}\n"
+                f"Execution price: {execution_price:.3f}\n"
+                f"Comment: {marker}\n"
+                f"Client ID: {client_id}\n"
+                f"Connection state: {metaapi_connection_state}\n"
                 "Checking account and live quote before order."
             )
 
@@ -2213,25 +2216,15 @@ async def execute_signal(
             print("   ==================================================")
 
             await send_notification(
-                "📤 METAAPI ORDER REQUEST SENT
-
-"
-                f"Signal ID: {signal['signal_id']}
-"
-                f"Position: {position_number}/{POSITIONS_PER_SIGNAL}
-"
-                f"Direction: {direction}
-"
-                f"Symbol: {SYMBOL}
-"
-                f"Volume: {LOT_SIZE}
-"
-                f"SL: {signal['stoploss']}
-"
-                f"TP{tp_number}: {tp_price}
-"
-                f"Execution price: {execution_price:.3f}
-"
+                "📤 METAAPI ORDER REQUEST SENT\n\n"
+                f"Signal ID: {signal['signal_id']}\n"
+                f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
+                f"Direction: {direction}\n"
+                f"Symbol: {SYMBOL}\n"
+                f"Volume: {LOT_SIZE}\n"
+                f"SL: {signal['stoploss']}\n"
+                f"TP{tp_number}: {tp_price}\n"
+                f"Execution price: {execution_price:.3f}\n"
                 "Waiting up to 30 seconds for MetaApi response."
             )
 
@@ -2269,19 +2262,12 @@ async def execute_signal(
                 print(f"   Raw response:  {result!r}")
 
                 await send_notification(
-                    "📨 METAAPI ORDER RESPONSE RECEIVED
-
-"
-                    f"Signal ID: {signal['signal_id']}
-"
-                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}
-"
-                    f"Response time: {elapsed:.3f}s
-"
-                    f"Result code: {get_field(result, 'stringCode', 'UNKNOWN')}
-"
-                    f"Position ID: {get_field(result, 'positionId', get_field(result, 'position_id', 'UNKNOWN'))}
-"
+                    "📨 METAAPI ORDER RESPONSE RECEIVED\n\n"
+                    f"Signal ID: {signal['signal_id']}\n"
+                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
+                    f"Response time: {elapsed:.3f}s\n"
+                    f"Result code: {get_field(result, 'stringCode', 'UNKNOWN')}\n"
+                    f"Position ID: {get_field(result, 'positionId', get_field(result, 'position_id', 'UNKNOWN'))}\n"
                     f"Raw result: {result!r}"
                 )
 
@@ -2292,6 +2278,14 @@ async def execute_signal(
                 print(f"   Waited: {elapsed:.3f} seconds")
                 print("   IMPORTANT: the broker may still have received the order.")
                 print("   Checking MT5 for the position before allowing any retry.")
+
+                await send_notification(
+                    "⏰ METAAPI ORDER REQUEST TIMED OUT\n\n"
+                    f"Signal ID: {signal['signal_id']}\n"
+                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
+                    f"Waited: {elapsed:.3f}s\n"
+                    "Phase 6 will verify MT5 before retrying."
+                )
 
                 try:
                     await asyncio.sleep(1)
@@ -2332,17 +2326,11 @@ async def execute_signal(
                 print(f"   Exception: {order_error}")
 
                 await send_notification(
-                    "❌ METAAPI ORDER REQUEST FAILED
-
-"
-                    f"Signal ID: {signal['signal_id']}
-"
-                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}
-"
-                    f"Exception type: {type(order_error).__name__}
-"
-                    f"Exception: {order_error}
-"
+                    "❌ METAAPI ORDER REQUEST FAILED\n\n"
+                    f"Signal ID: {signal['signal_id']}\n"
+                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
+                    f"Exception type: {type(order_error).__name__}\n"
+                    f"Exception: {order_error}\n"
                     f"Details: {getattr(order_error, 'details', None)!r}"
                 )
 
@@ -2357,7 +2345,7 @@ async def execute_signal(
                 # client. Use it when available, but never let diagnostics
                 # hide the original exception.
                 try:
-                    formatter = getattr(metaapi, "format_error", None)
+                    formatter = getattr(api, "format_error", None)
                     if callable(formatter):
                         print("   Formatted MetaApi error:")
                         print(f"      {formatter(order_error)}")
@@ -2431,6 +2419,15 @@ async def execute_signal(
                     f"❌ POSITION {position_number} FAILED - "
                     f"MetaApi code: {result_code}"
                 )
+
+                await send_notification(
+                    "❌ POSITION REJECTED BY METAAPI\n\n"
+                    f"Signal ID: {signal['signal_id']}\n"
+                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
+                    f"MetaApi result code: {result_code}\n"
+                    f"Raw result: {result!r}"
+                )
+
                 return False, positions
 
             # Confirm the position really exists before considering the
@@ -2447,6 +2444,14 @@ async def execute_signal(
                     f"⚠️ POSITION {position_number} order response was received, "
                     "but MT5 position verification failed."
                 )
+
+                await send_notification(
+                    "⚠️ ORDER RESPONSE RECEIVED BUT MT5 VERIFICATION FAILED\n\n"
+                    f"Signal ID: {signal['signal_id']}\n"
+                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
+                    "Phase 6 will not blindly duplicate the order."
+                )
+
                 return False, positions
 
             if not position_id:
@@ -2465,6 +2470,15 @@ async def execute_signal(
             )
             print(
                 f"   Position ID: {position_id or 'Unknown'}"
+            )
+
+            await send_notification(
+                "✅ POSITION EXECUTED AND VERIFIED\n\n"
+                f"Signal ID: {signal['signal_id']}\n"
+                f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
+                f"TP{tp_number}: {tp_price}\n"
+                f"Position ID: {position_id or 'Unknown'}\n"
+                f"MetaApi result code: {result_code}"
             )
 
             positions.append({
@@ -2665,6 +2679,18 @@ async def wait_for_entry(
                 print(f"   SL: {signal['stoploss']}")
                 print(f"   Execution TPs: {signal['execution_tps']}")
 
+                await send_notification(
+                    "🚀 TRADE EXECUTION STARTING\n\n"
+                    f"Signal ID: {signal_id}\n"
+                    f"Direction: {signal['direction']}\n"
+                    f"Symbol: {SYMBOL}\n"
+                    f"Volume per position: {LOT_SIZE}\n"
+                    f"Execution price: {execution_price:.3f}\n"
+                    f"SL: {signal['stoploss']}\n"
+                    f"Execution TPs: {signal['execution_tps']}\n"
+                    f"MetaApi state: {metaapi_connection_state}"
+                )
+
                 success, positions = await execute_signal(
                     signal,
                     execution_price
@@ -2807,33 +2833,19 @@ async def wait_for_entry(
                     signal_status_report_times[signal_id] = now_timestamp
 
                     await send_notification(
-                        "🔄 ENTRY WATCHER HEARTBEAT
-
-"
-                        f"Signal ID: {signal_id}
-"
-                        f"Time: {format_cat_time(now_iso())}
-"
-                        f"Direction: {signal['direction']}
-"
-                        f"Bid: {bid:.3f}
-"
-                        f"Ask: {ask:.3f}
-"
-                        f"Execution price: {execution_price:.3f}
-"
-                        f"Original range: {signal['entry_low']:.3f} - {signal['entry_high']:.3f}
-"
-                        f"Extended range: {extended_low:.3f} - {extended_high:.3f}
-"
-                        f"Inside original: {'YES' if inside_original else 'NO'}
-"
-                        f"Inside extended: {'YES' if inside_extended else 'NO'}
-"
-                        f"MetaApi state: {metaapi_connection_state}
-"
-                        f"Valid until: {format_cat_time(signal['valid_until'])}
-"
+                        "🔄 ENTRY WATCHER HEARTBEAT\n\n"
+                        f"Signal ID: {signal_id}\n"
+                        f"Time: {format_cat_time(now_iso())}\n"
+                        f"Direction: {signal['direction']}\n"
+                        f"Bid: {bid:.3f}\n"
+                        f"Ask: {ask:.3f}\n"
+                        f"Execution price: {execution_price:.3f}\n"
+                        f"Original range: {signal['entry_low']:.3f} - {signal['entry_high']:.3f}\n"
+                        f"Extended range: {extended_low:.3f} - {extended_high:.3f}\n"
+                        f"Inside original: {'YES' if inside_original else 'NO'}\n"
+                        f"Inside extended: {'YES' if inside_extended else 'NO'}\n"
+                        f"MetaApi state: {metaapi_connection_state}\n"
+                        f"Valid until: {format_cat_time(signal['valid_until'])}\n"
                         "Decision: WAIT — no order has been sent."
                     )
 
@@ -2881,12 +2893,12 @@ async def wait_for_entry(
             save_pending_signals()
 
             await send_notification(
-                "🟢 ENTRY RANGE REACHED - TRADE EXECUTION STARTING\n\n"
+                "🎯 ENTRY RANGE REACHED\n\n"
                 f"Signal ID: {signal_id}\n"
                 f"Direction: {signal['direction']}\n"
                 f"Current Price: {execution_price:.3f}\n"
                 f"Allowed Range: {extended_low:.3f}-{extended_high:.3f}\n"
-                "The execution trigger is now locked; a temporary MetaApi outage will not cancel the valid signal."
+                "Decision: LOCK ENTRY AND START EXECUTION."
             )
 
     except asyncio.CancelledError:
@@ -3736,13 +3748,9 @@ async def handle_message(
             print("   Check that Phase 4 sent the expected execution fields.")
 
             await send_notification(
-                "❌ PHASE 6 COULD NOT READ PHASE 4 MESSAGE
-
-"
-                f"Message ID: {message_id}
-"
-                "No trade attempt was made.
-"
+                "❌ PHASE 6 COULD NOT READ PHASE 4 MESSAGE\n\n"
+                f"Message ID: {message_id}\n"
+                "No trade attempt was made.\n"
                 "Reason: read_phase4_execution_message() returned None."
             )
             return
@@ -3758,23 +3766,14 @@ async def handle_message(
         print(f"   Valid Until: {format_cat_time(signal.get('valid_until'))}")
 
         await send_notification(
-            "✅ PHASE 6 READ PHASE 4 EXECUTION DATA
-
-"
-            f"Signal ID: {signal.get('signal_id')}
-"
-            f"Direction: {signal.get('direction')}
-"
-            f"Entry: {signal.get('entry_low')} - {signal.get('entry_high')}
-"
-            f"SL: {signal.get('stoploss')}
-"
-            f"Execution TPs: {signal.get('execution_tps')}
-"
-            f"TP numbers: {signal.get('execution_tp_numbers')}
-"
-            f"Valid until: {format_cat_time(signal.get('valid_until'))}
-"
+            "✅ PHASE 6 READ PHASE 4 EXECUTION DATA\n\n"
+            f"Signal ID: {signal.get('signal_id')}\n"
+            f"Direction: {signal.get('direction')}\n"
+            f"Entry: {signal.get('entry_low')} - {signal.get('entry_high')}\n"
+            f"SL: {signal.get('stoploss')}\n"
+            f"Execution TPs: {signal.get('execution_tps')}\n"
+            f"TP numbers: {signal.get('execution_tp_numbers')}\n"
+            f"Valid until: {format_cat_time(signal.get('valid_until'))}\n"
             f"Telegram message ID: {message_id}"
         )
 
@@ -3891,19 +3890,12 @@ async def handle_message(
         print(f"   Extension: {ENTRY_EXTENSION_PRICE:.3f} price units")
 
         await send_notification(
-            "📐 EXECUTION RANGE CALCULATED
-
-"
-            f"Signal ID: {signal_id}
-"
-            f"Direction: {signal['direction']}
-"
-            f"Original entry: {signal['entry_low']:.3f} - {signal['entry_high']:.3f}
-"
-            f"Allowed range: {extended_low:.3f} - {extended_high:.3f}
-"
-            f"Extension: {ENTRY_EXTENSION_PRICE:.3f}
-"
+            "📐 EXECUTION RANGE CALCULATED\n\n"
+            f"Signal ID: {signal_id}\n"
+            f"Direction: {signal['direction']}\n"
+            f"Original entry: {signal['entry_low']:.3f} - {signal['entry_high']:.3f}\n"
+            f"Allowed range: {extended_low:.3f} - {extended_high:.3f}\n"
+            f"Extension: {ENTRY_EXTENSION_PRICE:.3f}\n"
             f"Valid until: {format_cat_time(signal['valid_until'])}"
         )
 
@@ -3959,21 +3951,13 @@ async def handle_message(
         print("   Checking price every 2 seconds.")
 
         await send_notification(
-            "🟡 ENTRY WATCHER STARTED
-
-"
-            f"Signal ID: {signal_id}
-"
-            f"Symbol: {SYMBOL}
-"
-            f"Direction: {signal['direction']}
-"
-            f"Allowed range: {extended_low:.3f} - {extended_high:.3f}
-"
-            f"Valid until: {format_cat_time(signal['valid_until'])}
-"
-            "Price checks: every 2 seconds
-"
+            "🟡 ENTRY WATCHER STARTED\n\n"
+            f"Signal ID: {signal_id}\n"
+            f"Symbol: {SYMBOL}\n"
+            f"Direction: {signal['direction']}\n"
+            f"Allowed range: {extended_low:.3f} - {extended_high:.3f}\n"
+            f"Valid until: {format_cat_time(signal['valid_until'])}\n"
+            "Price checks: every 2 seconds\n"
             "Telegram market heartbeat: every 30 seconds."
         )
 
@@ -4178,41 +4162,40 @@ def display_settings():
 async def status_heartbeat():
 
     while True:
+
         try:
+
             active_watchers = sum(
-                1 for task in watch_tasks.values()
+                1
+                for task in watch_tasks.values()
                 if task is not None and not task.done()
             )
 
             await send_notification(
-                "💓 PHASE 6 HEARTBEAT
-
-"
-                f"Time: {format_cat_time(now_iso())}
-"
-                f"MetaApi: {metaapi_connection_state}
-"
-                f"Symbol: {SYMBOL}
-"
-                f"Active watchers: {active_watchers}
-"
-                f"Pending signals: {len(pending_signals)}
-"
-                f"Executed signals in memory: {len(executed_signals)}
-"
-                "Telegram listener: ACTIVE
-"
+                "💓 PHASE 6 HEARTBEAT\n\n"
+                f"Time: {format_cat_time(now_iso())}\n"
+                f"MetaApi: {metaapi_connection_state}\n"
+                f"Symbol: {SYMBOL}\n"
+                f"Active watchers: {active_watchers}\n"
+                f"Pending signals: {len(pending_signals)}\n"
+                f"Executed signals in memory: {len(executed_signals)}\n"
+                "Telegram listener: ACTIVE\n"
                 "Worker: ALIVE"
             )
+
         except asyncio.CancelledError:
             raise
+
         except Exception as error:
+
             print(
                 "⚠️ Status heartbeat failed: "
                 f"{type(error).__name__}: {error}"
             )
 
-        await asyncio.sleep(STATUS_HEARTBEAT_SECONDS)
+        await asyncio.sleep(
+            STATUS_HEARTBEAT_SECONDS
+        )
 
 
 # ============================================================
@@ -4693,18 +4676,11 @@ async def main():
             )
 
             await send_notification(
-                "📥 PHASE 4 MESSAGE RECEIVED
-
-"
-                f"Time: {format_cat_time(now_iso())}
-"
-                f"Message ID: {event.message.id}
-"
-                f"Chat ID: {event_chat_id}
-
-"
-                "Raw message:
-"
+                "📥 PHASE 4 MESSAGE RECEIVED\n\n"
+                f"Time: {format_cat_time(now_iso())}\n"
+                f"Message ID: {event.message.id}\n"
+                f"Chat ID: {event_chat_id}\n\n"
+                "Raw message:\n"
                 f"{event.raw_text or '[EMPTY]'}"
             )
 
@@ -4787,25 +4763,15 @@ async def main():
         )
 
     await send_notification(
-        "🟢 PHASE 6 DEMO EXECUTOR ONLINE
-
-"
-        f"Time: {format_cat_time(now_iso())}
-"
-        f"MetaApi connection: {metaapi_connection_state}
-"
-        f"MT5 symbol: {SYMBOL}
-"
-        f"Lot size: {LOT_SIZE} x {POSITIONS_PER_SIGNAL} positions
-"
-        f"Phase 4 INPUT channel: {PHASE4_OUTPUT_CHANNEL_ID}
-"
-        f"Phase 6 STATUS channel: {PHASE6_STATUS_CHAT_ID or 'NOT CONFIGURED'}
-"
-        "Telegram listener: ACTIVE
-"
-        "Detailed diagnostics: ACTIVE
-"
+        "🟢 PHASE 6 DEMO EXECUTOR ONLINE\n\n"
+        f"Time: {format_cat_time(now_iso())}\n"
+        f"MetaApi connection: {metaapi_connection_state}\n"
+        f"MT5 symbol: {SYMBOL}\n"
+        f"Lot size: {LOT_SIZE} x {POSITIONS_PER_SIGNAL} positions\n"
+        f"Phase 4 INPUT channel: {PHASE4_OUTPUT_CHANNEL_ID}\n"
+        f"Phase 6 STATUS channel: {PHASE6_STATUS_CHAT_ID or 'NOT CONFIGURED'}\n"
+        "Telegram listener: ACTIVE\n"
+        "Detailed diagnostics: ACTIVE\n"
         "⚠️ DEMO ONLY"
     )
 
