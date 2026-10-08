@@ -217,6 +217,7 @@ SIGNAL_STATUS_REPORT_SECONDS = 30
 # MetaApi connection state tracking
 metaapi_connection_state = "UNKNOWN"
 metaapi_connection_lock = None
+metaapi_operation_lock = None
 
 
 # ============================================================
@@ -1435,47 +1436,141 @@ async def ensure_metaapi_connection(
 
 async def metaapi_connection_monitor():
 
+    global metaapi_operation_lock
+
+    if metaapi_operation_lock is None:
+        metaapi_operation_lock = asyncio.Lock()
+
     while True:
 
         try:
-            refreshed = await refresh_metaapi_account()
-            if refreshed is not None:
-                status = str(
-                    get_field(
-                        refreshed,
-                        "connectionStatus",
-                        get_field(refreshed, "connection_status", "UNKNOWN")
-                    )
-                ).upper()
 
-                if status in ("DISCONNECTED", "DISCONNECTED_FROM_BROKER"):
-                    await set_metaapi_connection_state(
-                        status,
-                        "MetaApi account status monitor detected the disconnection."
-                    )
-                elif status == "CONNECTED":
-                    # The provisioning status says CONNECTED, but also test the
-                    # actual RPC socket so a dead websocket is not reported as healthy.
-                    try:
-                        if connection is None:
-                            raise RuntimeError("RPC connection is not available")
-                        await connection.get_account_information()
-                        await set_metaapi_connection_state("CONNECTED")
-                    except Exception as error:
-                        await set_metaapi_connection_state(
-                            "LOST",
-                            f"RPC connection test failed: {error}"
+            # Serialize health checks with entry-price reads and trade
+            # execution so this monitor can never close/replace the RPC
+            # connection while another Phase 6 operation is using it.
+            async with metaapi_operation_lock:
+
+                refreshed = await refresh_metaapi_account()
+
+                if refreshed is not None:
+                    status = str(
+                        get_field(
+                            refreshed,
+                            "connectionStatus",
+                            get_field(refreshed, "connection_status", "UNKNOWN")
                         )
+                    ).upper()
+
+                    if status in ("DISCONNECTED", "DISCONNECTED_FROM_BROKER"):
+                        await set_metaapi_connection_state(
+                            status,
+                            "MetaApi account status monitor detected the disconnection."
+                        )
+
+                    elif status == "CONNECTED":
+                        try:
+                            if connection is None:
+                                raise RuntimeError("RPC connection is not available")
+
+                            # Keep the health probe bounded. A stuck RPC request
+                            # must not block Phase 6 indefinitely.
+                            await asyncio.wait_for(
+                                connection.get_account_information(),
+                                timeout=10
+                            )
+
+                            await set_metaapi_connection_state("CONNECTED")
+
+                        except Exception as error:
+
+                            print()
+                            print("⚠️ MetaApi monitor RPC health check failed:")
+                            print(f"   {type(error).__name__}: {error}")
+
+                            await set_metaapi_connection_state(
+                                "LOST",
+                                f"RPC connection test failed: {error}"
+                            )
+
+                            # Recover immediately while the operation lock is
+                            # still held. The entry watcher does not have to wait
+                            # for another 10-second monitor cycle.
+                            recovered = await ensure_metaapi_connection()
+
+                            if recovered:
+                                print("🟢 MetaApi monitor recovered the RPC connection.")
+
+        except asyncio.CancelledError:
+            raise
 
         except Exception as error:
             print(
-                f"⚠️ MetaApi connection monitor error: {error}"
+                f"⚠️ MetaApi connection monitor error: {type(error).__name__}: {error}"
             )
 
         await asyncio.sleep(
             CONNECTION_STATUS_CHECK_SECONDS
         )
 
+
+
+async def get_current_price_with_recovery(valid_until=None):
+    """Get the live price while serializing MetaApi access and recovering a bad RPC socket."""
+
+    global metaapi_operation_lock
+
+    if metaapi_operation_lock is None:
+        metaapi_operation_lock = asyncio.Lock()
+
+    async with metaapi_operation_lock:
+
+        # First attempt: ensure the RPC connection and read the quote.
+        connected = await ensure_metaapi_connection(valid_until)
+        if not connected:
+            return None
+
+        try:
+            bid, ask = await asyncio.wait_for(
+                get_current_price(),
+                timeout=10
+            )
+            return bid, ask
+
+        except Exception as first_error:
+
+            print()
+            print("⚠️ LIVE PRICE REQUEST FAILED")
+            print(f"   {type(first_error).__name__}: {first_error}")
+            print("   Phase 6 will immediately rebuild the RPC connection and retry the quote.")
+
+            await set_metaapi_connection_state(
+                "LOST",
+                str(first_error)
+            )
+
+            # Force the connection manager to validate/rebuild the socket.
+            recovered = await ensure_metaapi_connection(valid_until)
+
+            if not recovered:
+                return None
+
+            try:
+                bid, ask = await asyncio.wait_for(
+                    get_current_price(),
+                    timeout=10
+                )
+                await set_metaapi_connection_state("CONNECTED")
+                print("🟢 LIVE PRICE RECOVERED AFTER RPC FAILURE")
+                return bid, ask
+
+            except Exception as second_error:
+                await set_metaapi_connection_state(
+                    "LOST",
+                    f"Quote retry failed: {second_error}"
+                )
+                print("❌ LIVE PRICE RETRY FAILED")
+                print(f"   {type(second_error).__name__}: {second_error}")
+                return None
 
 # ============================================================
 # CALCULATE EXTENDED RANGE
@@ -2040,6 +2135,24 @@ def build_position_record(
 
 
 async def execute_signal(
+    signal,
+    execution_price
+):
+    """Serialize the complete order sequence against the MetaApi monitor."""
+
+    global metaapi_operation_lock
+
+    if metaapi_operation_lock is None:
+        metaapi_operation_lock = asyncio.Lock()
+
+    async with metaapi_operation_lock:
+        return await _execute_signal_locked(
+            signal,
+            execution_price
+        )
+
+
+async def _execute_signal_locked(
     signal,
     execution_price
 ):
@@ -2638,13 +2751,13 @@ async def wait_for_entry(
                 save_lifecycle()
                 save_pending_signals()
 
-                connected = await ensure_metaapi_connection(
+                price_result = await get_current_price_with_recovery(
                     signal.get("valid_until")
                 )
 
-                if not connected:
+                if price_result is None:
                     print()
-                    print("🔴 EXECUTION BLOCKED: METAPI NOT CONNECTED")
+                    print("🔴 EXECUTION BLOCKED: METAPI PRICE UNAVAILABLE")
                     print(f"   Signal ID: {signal_id}")
                     print("   Decision: keep signal pending and retry.")
                     if signal_is_expired(signal):
@@ -2654,20 +2767,10 @@ async def wait_for_entry(
                     )
                     continue
 
-                try:
-                    bid, ask = await get_current_price()
-                    execution_price = (
-                        bid if signal["direction"] == "SELL" else ask
-                    )
-                except Exception as error:
-                    await set_metaapi_connection_state(
-                        "LOST",
-                        str(error)
-                    )
-                    await asyncio.sleep(
-                        PRICE_CHECK_INTERVAL_SECONDS
-                    )
-                    continue
+                bid, ask = price_result
+                execution_price = (
+                    bid if signal["direction"] == "SELL" else ask
+                )
 
                 print()
                 print("🚀 STARTING TRADE EXECUTION")
@@ -2753,30 +2856,21 @@ async def wait_for_entry(
                 continue
 
             # Normal pre-entry monitoring. Connection errors here are recoverable.
-            try:
-                connected = await ensure_metaapi_connection(
-                    signal.get("valid_until")
-                )
-                if not connected:
-                    await asyncio.sleep(
-                        PRICE_CHECK_INTERVAL_SECONDS
-                    )
-                    continue
+            price_result = await get_current_price_with_recovery(
+                signal.get("valid_until")
+            )
 
-                bid, ask = await get_current_price()
-
-            except Exception as error:
+            if price_result is None:
                 print(
-                    f"⚠️ Price/connection check failed for {signal_id}: {error}"
-                )
-                await set_metaapi_connection_state(
-                    "LOST",
-                    str(error)
+                    f"⚠️ Price/connection check failed for {signal_id}; "
+                    "Phase 6 will retry automatically."
                 )
                 await asyncio.sleep(
                     PRICE_CHECK_INTERVAL_SECONDS
                 )
                 continue
+
+            bid, ask = price_result
 
             execution_price = (
                 bid if signal["direction"] == "SELL" else ask
@@ -3725,6 +3819,12 @@ async def handle_message(
 
             return
 
+        # Phase 4 input is read-only. If the status chat is accidentally
+        # configured to the same Telegram chat, ignore Phase 6 heartbeat and
+        # diagnostic messages instead of feeding them back into Phase 6.
+        if "SIGNAL PARSED" not in message_text.upper():
+            return
+
         message_id = int(
             event.message.id
         )
@@ -4461,6 +4561,7 @@ async def main():
     )
 
     metaapi_connection_lock = asyncio.Lock()
+    metaapi_operation_lock = asyncio.Lock()
 
     # Read the broker/application connection status explicitly.
     refreshed_account = await refresh_metaapi_account()
