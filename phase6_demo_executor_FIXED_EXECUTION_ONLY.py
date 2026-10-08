@@ -1472,33 +1472,107 @@ async def metaapi_connection_monitor():
                             if connection is None:
                                 raise RuntimeError("RPC connection is not available")
 
-                            # Keep the health probe bounded. A stuck RPC request
-                            # must not block Phase 6 indefinitely.
-                            await asyncio.wait_for(
-                                connection.get_account_information(),
-                                timeout=10
-                            )
+                            # A single RPC timeout does NOT mean the whole
+                            # MetaApi connection is dead. Retry the SAME RPC
+                            # request first. Only after repeated failure do we
+                            # test another RPC before declaring the connection LOST.
+                            account_info = None
+                            last_error = None
 
-                            await set_metaapi_connection_state("CONNECTED")
+                            for retry_number in range(1, 3):
+                                try:
+                                    account_info = await asyncio.wait_for(
+                                        connection.get_account_information(),
+                                        timeout=10
+                                    )
+                                    break
+                                except Exception as error:
+                                    last_error = error
+                                    print()
+                                    print(
+                                        f"⚠️ MetaApi account RPC attempt "
+                                        f"{retry_number}/2 failed:"
+                                    )
+                                    print(
+                                        f"   {type(error).__name__}: {error}"
+                                    )
+
+                                    if retry_number < 2:
+                                        print(
+                                            "   Retrying the SAME RPC request "
+                                            "before declaring MetaApi LOST..."
+                                        )
+                                        await asyncio.sleep(1)
+
+                            if account_info is not None:
+                                await set_metaapi_connection_state("CONNECTED")
+
+                            else:
+                                # The account RPC failed repeatedly. Test a
+                                # different lightweight RPC before deciding
+                                # that the RPC/WebSocket connection itself is
+                                # unhealthy. The quote request is safe and does
+                                # not place a trade.
+                                print()
+                                print(
+                                    "⚠️ Account RPC failed twice; testing "
+                                    "XAUUSD_i symbol RPC before reconnecting..."
+                                )
+
+                                try:
+                                    symbol_price = await asyncio.wait_for(
+                                        connection.get_symbol_price(SYMBOL),
+                                        timeout=10
+                                    )
+
+                                    if symbol_price is not None:
+                                        print(
+                                            "✅ Symbol RPC succeeded after "
+                                            "account RPC timeout. Keeping MetaApi CONNECTED."
+                                        )
+                                        await set_metaapi_connection_state(
+                                            "CONNECTED"
+                                        )
+                                    else:
+                                        raise RuntimeError(
+                                            "Symbol RPC returned no price data"
+                                        )
+
+                                except Exception as symbol_error:
+                                    print()
+                                    print(
+                                        "🔴 Account RPC and symbol RPC both failed."
+                                    )
+                                    print(
+                                        f"   Account RPC: {type(last_error).__name__}: {last_error}"
+                                    )
+                                    print(
+                                        f"   Symbol RPC:  {type(symbol_error).__name__}: {symbol_error}"
+                                    )
+
+                                    await set_metaapi_connection_state(
+                                        "LOST",
+                                        "Repeated RPC failures: "
+                                        f"account RPC={last_error}; "
+                                        f"symbol RPC={symbol_error}"
+                                    )
+
+                                    # Only now rebuild the RPC connection.
+                                    recovered = await ensure_metaapi_connection()
+
+                                    if recovered:
+                                        print(
+                                            "🟢 MetaApi monitor recovered the RPC connection."
+                                        )
+
+                        except asyncio.CancelledError:
+                            raise
 
                         except Exception as error:
-
                             print()
-                            print("⚠️ MetaApi monitor RPC health check failed:")
-                            print(f"   {type(error).__name__}: {error}")
-
-                            await set_metaapi_connection_state(
-                                "LOST",
-                                f"RPC connection test failed: {error}"
+                            print(
+                                f"⚠️ MetaApi monitor RPC health check error: {type(error).__name__}: {error}"
                             )
-
-                            # Recover immediately while the operation lock is
-                            # still held. The entry watcher does not have to wait
-                            # for another 10-second monitor cycle.
-                            recovered = await ensure_metaapi_connection()
-
-                            if recovered:
-                                print("🟢 MetaApi monitor recovered the RPC connection.")
 
         except asyncio.CancelledError:
             raise
@@ -1541,18 +1615,11 @@ async def get_current_price_with_recovery(valid_until=None):
             print()
             print("⚠️ LIVE PRICE REQUEST FAILED")
             print(f"   {type(first_error).__name__}: {first_error}")
-            print("   Phase 6 will immediately rebuild the RPC connection and retry the quote.")
+            print("   Retrying the SAME quote RPC before rebuilding the connection...")
 
-            await set_metaapi_connection_state(
-                "LOST",
-                str(first_error)
-            )
-
-            # Force the connection manager to validate/rebuild the socket.
-            recovered = await ensure_metaapi_connection(valid_until)
-
-            if not recovered:
-                return None
+            # A transient quote RPC timeout is not enough to declare the
+            # connection dead. Retry the exact same quote request first.
+            await asyncio.sleep(1)
 
             try:
                 bid, ask = await asyncio.wait_for(
@@ -1560,17 +1627,72 @@ async def get_current_price_with_recovery(valid_until=None):
                     timeout=10
                 )
                 await set_metaapi_connection_state("CONNECTED")
-                print("🟢 LIVE PRICE RECOVERED AFTER RPC FAILURE")
+                print("🟢 LIVE PRICE RPC RECOVERED ON RETRY")
                 return bid, ask
 
             except Exception as second_error:
-                await set_metaapi_connection_state(
-                    "LOST",
-                    f"Quote retry failed: {second_error}"
-                )
-                print("❌ LIVE PRICE RETRY FAILED")
-                print(f"   {type(second_error).__name__}: {second_error}")
-                return None
+                print()
+                print("⚠️ LIVE PRICE RPC FAILED TWICE")
+                print(f"   First:  {type(first_error).__name__}: {first_error}")
+                print(f"   Second: {type(second_error).__name__}: {second_error}")
+                print("   Testing the account RPC before rebuilding the connection...")
+
+                try:
+                    account_info = await asyncio.wait_for(
+                        connection.get_account_information(),
+                        timeout=10
+                    )
+
+                    if account_info is not None:
+                        await set_metaapi_connection_state("CONNECTED")
+                        print(
+                            "✅ Account RPC succeeded after quote failure. "
+                            "Keeping MetaApi CONNECTED."
+                        )
+                        return None
+
+                    raise RuntimeError(
+                        "Account RPC returned no account information"
+                    )
+
+                except Exception as account_error:
+                    print("🔴 Quote RPC and account RPC both failed.")
+                    print(
+                        f"   Account RPC: {type(account_error).__name__}: {account_error}"
+                    )
+
+                    await set_metaapi_connection_state(
+                        "LOST",
+                        "Repeated RPC failures: "
+                        f"quote={second_error}; account={account_error}"
+                    )
+
+                    # Only after the same quote RPC failed twice and a second
+                    # RPC also failed do we rebuild the RPC connection.
+                    recovered = await ensure_metaapi_connection(valid_until)
+
+                    if not recovered:
+                        return None
+
+                    try:
+                        bid, ask = await asyncio.wait_for(
+                            get_current_price(),
+                            timeout=10
+                        )
+                        await set_metaapi_connection_state("CONNECTED")
+                        print("🟢 LIVE PRICE RECOVERED AFTER RPC RECONNECT")
+                        return bid, ask
+
+                    except Exception as reconnect_error:
+                        await set_metaapi_connection_state(
+                            "LOST",
+                            f"Quote retry after reconnect failed: {reconnect_error}"
+                        )
+                        print("❌ LIVE PRICE RETRY AFTER RECONNECT FAILED")
+                        print(
+                            f"   {type(reconnect_error).__name__}: {reconnect_error}"
+                        )
+                        return None
 
 # ============================================================
 # CALCULATE EXTENDED RANGE
