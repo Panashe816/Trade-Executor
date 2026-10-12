@@ -9,7 +9,7 @@ import aiohttp
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from metaapi_cloud_sdk import MetaApi
+
 
 
 # ============================================================
@@ -66,18 +66,12 @@ PHASE4_OUTPUT_CHANNEL_ID = -1003995895185
 
 
 # ============================================================
-# METAAPI CONFIGURATION
+# LOCAL EXECUTION API CONFIGURATION
 # ============================================================
 
-METAAPI_TOKEN = os.getenv(
-    "METAAPI_TOKEN",
-    ""
-)
-
-METAAPI_ACCOUNT_ID = os.getenv(
-    "METAAPI_ACCOUNT_ID",
-    ""
-)
+EXECUTION_API_URL = os.getenv("EXECUTION_API_URL", "http://127.0.0.1:8000").rstrip("/")
+EXECUTION_API_KEY = os.getenv("EXECUTION_API_KEY", "")
+API_REQUEST_TIMEOUT_SECONDS = float(os.getenv("API_REQUEST_TIMEOUT_SECONDS", "12"))
 
 
 # ============================================================
@@ -157,7 +151,7 @@ CAT = ZoneInfo("Africa/Harare")
 DAILY_REPORT_HOUR = 4
 DAILY_REPORT_MINUTE = 0
 
-# MetaApi recovery settings
+# Local API health settings
 CONNECTION_RETRY_DELAYS_SECONDS = [2, 4, 8, 15, 30]
 CONNECTION_STATUS_CHECK_SECONDS = 10
 
@@ -199,7 +193,7 @@ lifecycle_signals = {}
 
 daily_reported_dates = set()
 
-metaapi = None
+api_session = None
 
 account = None
 
@@ -1135,686 +1129,160 @@ def read_phase4_execution_message(message, chat_id, message_id):
 
 
 # ============================================================
-# METAAPI SYMBOL SPECIFICATION
+# ============================================================
+# LOCAL FASTAPI -> WINDOWS MT5 ADAPTER
 # ============================================================
 
-async def verify_symbol():
-
-    specification = (
-        await connection
-        .get_symbol_specification(
-            SYMBOL
-        )
-    )
-
-    digits = get_field(
-        specification,
-        "digits",
-        "Unknown"
-    )
-
-    min_volume = get_field(
-        specification,
-        "minVolume",
-        None
-    )
-
-    if min_volume is None:
-
-        min_volume = get_field(
-            specification,
-            "min_volume",
-            "Unknown"
-        )
-
-    volume_step = get_field(
-        specification,
-        "volumeStep",
-        None
-    )
-
-    if volume_step is None:
-
-        volume_step = get_field(
-            specification,
-            "volume_step",
-            "Unknown"
-        )
-
-    print()
-    print(
-        f"✅ {SYMBOL} available"
-    )
-
-    print(
-        f"   Digits: {digits}"
-    )
-
-    print(
-        f"   Min volume: {min_volume}"
-    )
-
-    print(
-        f"   Volume step: {volume_step}"
-    )
-
-    return specification
-
-
-# ============================================================
-# GET CURRENT PRICE
-# ============================================================
-
-async def get_current_price():
-
-    price = (
-        await connection
-        .get_symbol_price(
-            SYMBOL
-        )
-    )
-
-    bid = get_field(
-        price,
-        "bid"
-    )
-
-    ask = get_field(
-        price,
-        "ask"
-    )
-
-    if bid is None or ask is None:
-
-        raise RuntimeError(
-            f"Could not obtain price: {price}"
-        )
-
-    return (
-        float(bid),
-        float(ask)
-    )
-
+async def api_request(method, path, *, params=None, payload=None):
+    global api_session
+    if api_session is None or api_session.closed:
+        api_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_REQUEST_TIMEOUT_SECONDS))
+    async with api_session.request(method, f"{EXECUTION_API_URL}{path}",
+        headers={"X-API-Key": EXECUTION_API_KEY}, params=params, json=payload) as response:
+        body = await response.text()
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            data = {"detail": body[:1000]}
+        if response.status >= 400:
+            raise RuntimeError(f"Local execution API HTTP {response.status}: {data}")
+        return data
 
 
 async def refresh_metaapi_account():
-
     global account
-
-    if metaapi is None or not METAAPI_ACCOUNT_ID:
-        return None
-
     try:
-        account = await (
-            metaapi
-            .metatrader_account_api
-            .get_account(
-                METAAPI_ACCOUNT_ID
-            )
-        )
+        account = await api_request("GET", "/account")
         return account
-
     except Exception as error:
-        print(
-            f"⚠️ Could not refresh MetaApi account status: {error}"
-        )
+        print(f"⚠️ Could not refresh local MT5 API account status: {error}")
         return None
 
 
-async def set_metaapi_connection_state(
-    state,
-    reason=None
-):
-
+async def set_metaapi_connection_state(state, reason=None):
     global metaapi_connection_state
-
     normalized = str(state or "UNKNOWN").upper()
-
     if normalized == metaapi_connection_state:
         return
-
-    previous = metaapi_connection_state
     metaapi_connection_state = normalized
-
     if normalized in ("DISCONNECTED", "DISCONNECTED_FROM_BROKER", "LOST"):
-        print()
-        print("🔴 METAAPI CONNECTION LOST")
-        print(f"   Status: {normalized}")
-        if reason:
-            print(f"   Reason: {reason}")
-
-        await send_notification(
-            "🔴 METAAPI CONNECTION LOST\n\n"
-            f"Status: {normalized}\n"
-            + (f"Reason: {reason}\n" if reason else "")
-            + "Phase 6 is keeping valid pending signals alive and will retry automatically."
-        )
-
+        print(f"\n🔴 LOCAL MT5 API CONNECTION LOST: {reason or normalized}")
+        await send_notification("🔴 LOCAL MT5 API CONNECTION LOST\n\n"
+            f"Status: {normalized}\n" + (f"Reason: {reason}\n" if reason else "")
+            + "Phase 6 will keep valid pending signals and retry the local API.")
     elif normalized == "CONNECTED":
-        print()
-        print("🟢 METAAPI CONNECTION RESTORED")
-        print("   Status: CONNECTED")
-
-        await send_notification(
-            "🟢 METAAPI CONNECTION RESTORED\n\n"
-            "Status: CONNECTED\n"
-            "Phase 6 can resume pending execution attempts."
-        )
+        print("\n🟢 LOCAL MT5 API CONNECTION RESTORED")
+        await send_notification("🟢 LOCAL MT5 API CONNECTION RESTORED\n\nLocal API and MT5 are responding.")
 
 
-async def _rpc_account_information_with_retry(connection_obj, attempts=2, timeout=10):
-    """Retry one account RPC request before treating it as a broken socket."""
-
-    last_error = None
-
-    for attempt_number in range(1, attempts + 1):
+async def ensure_metaapi_connection(valid_until=None):
+    attempt = 0
+    while True:
+        if valid_until:
+            expiry = parse_datetime(valid_until)
+            if expiry and now_utc() >= expiry.astimezone(timezone.utc):
+                return False
         try:
-            result = await asyncio.wait_for(
-                connection_obj.get_account_information(),
-                timeout=timeout
-            )
-
-            if attempt_number > 1:
-                print(
-                    f"🟢 ACCOUNT RPC RECOVERED ON RETRY {attempt_number}/{attempts}"
-                )
-
-            return result
-
+            health = await api_request("GET", "/health")
+            if not health.get("mt5_connected") or not health.get("account_authenticated"):
+                raise RuntimeError(f"API/MT5 health check failed: {health}")
+            info = await api_request("GET", "/account")
+            if not info.get("is_demo"):
+                raise RuntimeError("Safety stop: local MT5 account is not demo.")
+            await set_metaapi_connection_state("CONNECTED")
+            return True
         except asyncio.CancelledError:
             raise
-
         except Exception as error:
-            last_error = error
-            print()
-            print(
-                f"⚠️ ACCOUNT RPC FAILED (attempt {attempt_number}/{attempts})"
-            )
-            print(
-                f"   Error: {type(error).__name__}: {error}"
-            )
-
-            if attempt_number < attempts:
-                await asyncio.sleep(0.5)
-
-    raise RuntimeError(
-        "Account RPC failed after "
-        f"{attempts} attempts: "
-        f"{type(last_error).__name__}: {last_error}"
-    )
-
-
-async def _rpc_symbol_price_with_retry(connection_obj, attempts=2, timeout=10):
-    """Retry the XAUUSD_i symbol RPC before treating the socket as broken."""
-
-    last_error = None
-
-    for attempt_number in range(1, attempts + 1):
-        try:
-            price = await asyncio.wait_for(
-                connection_obj.get_symbol_price(SYMBOL),
-                timeout=timeout
-            )
-
-            bid = get_field(price, "bid")
-            ask = get_field(price, "ask")
-
-            if bid is None or ask is None:
-                raise RuntimeError(
-                    f"Could not obtain price: {price}"
-                )
-
-            if attempt_number > 1:
-                print(
-                    f"🟢 SYMBOL RPC RECOVERED ON RETRY {attempt_number}/{attempts}"
-                )
-
-            return float(bid), float(ask)
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as error:
-            last_error = error
-            print()
-            print(
-                f"⚠️ SYMBOL RPC FAILED (attempt {attempt_number}/{attempts})"
-            )
-            print(
-                f"   Error: {type(error).__name__}: {error}"
-            )
-
-            if attempt_number < attempts:
-                await asyncio.sleep(0.5)
-
-    raise RuntimeError(
-        "Symbol RPC failed after "
-        f"{attempts} attempts: "
-        f"{type(last_error).__name__}: {last_error}"
-    )
-
-
-async def ensure_metaapi_connection(
-    valid_until=None
-):
-
-    global connection
-    global metaapi_connection_lock
-
-    if metaapi_connection_lock is None:
-        metaapi_connection_lock = asyncio.Lock()
-
-    async with metaapi_connection_lock:
-
-        attempt = 0
-        delay_index = 0
-
-        while True:
-
+            attempt += 1
+            await set_metaapi_connection_state("LOST", str(error))
+            delay = CONNECTION_RETRY_DELAYS_SECONDS[min(attempt-1, len(CONNECTION_RETRY_DELAYS_SECONDS)-1)]
             if valid_until:
                 expiry = parse_datetime(valid_until)
-                if expiry and now_utc() >= expiry.astimezone(timezone.utc):
-                    return False
+                if expiry:
+                    remaining = (expiry.astimezone(timezone.utc)-now_utc()).total_seconds()
+                    if remaining <= 0:
+                        return False
+                    delay = min(delay, max(1, int(remaining)))
+            print(f"🔄 Retrying local MT5 API in {delay}s: {error}")
+            await asyncio.sleep(delay)
 
-            fresh_account = await refresh_metaapi_account()
-
-            if fresh_account is not None:
-                status = str(
-                    get_field(
-                        fresh_account,
-                        "connectionStatus",
-                        get_field(fresh_account, "connection_status", "UNKNOWN")
-                    )
-                ).upper()
-
-                if status in ("DISCONNECTED", "DISCONNECTED_FROM_BROKER"):
-                    await set_metaapi_connection_state(
-                        status,
-                        "MetaApi account reports broker/application disconnection."
-                    )
-
-            try:
-
-                if connection is None:
-                    connection = account.get_rpc_connection()
-                    await connection.connect()
-                    await connection.wait_synchronized()
-
-                # A transient account RPC timeout is NOT enough to rebuild the
-                # socket. Retry the SAME RPC first.
-                await _rpc_account_information_with_retry(
-                    connection,
-                    attempts=2,
-                    timeout=10
-                )
-
-                refreshed = await refresh_metaapi_account()
-                if refreshed is not None:
-                    status = str(
-                        get_field(
-                            refreshed,
-                            "connectionStatus",
-                            get_field(refreshed, "connection_status", "UNKNOWN")
-                        )
-                    ).upper()
-
-                    if status not in ("CONNECTED", "UNKNOWN"):
-                        raise RuntimeError(
-                            f"MetaApi account status is {status}"
-                        )
-
-                await set_metaapi_connection_state("CONNECTED")
-                return True
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as error:
-
-                attempt += 1
-
-                # Before rebuilding the RPC socket, test a different RPC
-                # operation. One RPC can temporarily timeout while the socket
-                # itself remains usable, as demonstrated by the standalone
-                # diagnostic.
-                account_error = error
-                symbol_error = None
-
-                print()
-                print("⚠️ ACCOUNT RPC RETRIES EXHAUSTED")
-                print(
-                    f"   Account RPC error: {type(account_error).__name__}: {account_error}"
-                )
-                print("🔎 TESTING SYMBOL RPC BEFORE RECONNECTING...")
-
-                if connection is not None:
-                    try:
-                        await _rpc_symbol_price_with_retry(
-                            connection,
-                            attempts=2,
-                            timeout=10
-                        )
-
-                        # The symbol RPC still works, therefore the RPC socket
-                        # is usable. Do NOT declare MetaApi LOST or rebuild it.
-                        await set_metaapi_connection_state("CONNECTED")
-                        print(
-                            "🟢 SYMBOL RPC IS HEALTHY - KEEPING EXISTING RPC CONNECTION"
-                        )
-                        print(
-                            "   The account RPC failure was treated as a transient request failure."
-                        )
-                        return True
-
-                    except asyncio.CancelledError:
-                        raise
-
-                    except Exception as symbol_error_exception:
-                        symbol_error = symbol_error_exception
-
-                print()
-                print("🔴 METAAPI RPC HEALTH CHECK FAILED")
-                print(
-                    f"   Account RPC: {type(account_error).__name__}: {account_error}"
-                )
-                if symbol_error is not None:
-                    print(
-                        f"   Symbol RPC:  {type(symbol_error).__name__}: {symbol_error}"
-                    )
-                else:
-                    print("   Symbol RPC:  Not tested because RPC object was unavailable")
-                print("   Action: rebuilding RPC connection")
-
-                await set_metaapi_connection_state(
-                    "LOST",
-                    "Repeated RPC failures: "
-                    f"account RPC={type(account_error).__name__}: {account_error}; "
-                    + (
-                        f"symbol RPC={type(symbol_error).__name__}: {symbol_error}"
-                        if symbol_error is not None
-                        else "symbol RPC=unavailable"
-                    )
-                )
-
-                # Close the broken RPC socket and create a fresh one.
-                try:
-                    if connection is not None:
-                        await connection.close()
-                except Exception:
-                    pass
-
-                connection = None
-
-                refreshed = await refresh_metaapi_account()
-                if refreshed is not None:
-                    status = str(
-                        get_field(
-                            refreshed,
-                            "connectionStatus",
-                            get_field(refreshed, "connection_status", "UNKNOWN")
-                        )
-                    ).upper()
-                    print(
-                        f"   MetaApi account connectionStatus: {status}"
-                    )
-
-                delay = CONNECTION_RETRY_DELAYS_SECONDS[
-                    min(
-                        delay_index,
-                        len(CONNECTION_RETRY_DELAYS_SECONDS) - 1
-                    )
-                ]
-                delay_index += 1
-
-                if valid_until:
-                    expiry = parse_datetime(valid_until)
-                    if expiry:
-                        remaining = (
-                            expiry.astimezone(timezone.utc)
-                            - now_utc()
-                        ).total_seconds()
-                        if remaining <= 0:
-                            return False
-                        delay = min(delay, max(1, int(remaining)))
-
-                print(
-                    f"🔄 MetaApi retrying in {delay} seconds..."
-                )
-
-                await asyncio.sleep(delay)
 
 async def metaapi_connection_monitor():
-
-    global metaapi_operation_lock
-
-    if metaapi_operation_lock is None:
-        metaapi_operation_lock = asyncio.Lock()
-
     while True:
-
         try:
-
-            # Serialize health checks with entry-price reads and trade
-            # execution so this monitor can never close/replace the RPC
-            # connection while another Phase 6 operation is using it.
-            async with metaapi_operation_lock:
-
-                refreshed = await refresh_metaapi_account()
-
-                if refreshed is not None:
-                    status = str(
-                        get_field(
-                            refreshed,
-                            "connectionStatus",
-                            get_field(refreshed, "connection_status", "UNKNOWN")
-                        )
-                    ).upper()
-
-                    if status in ("DISCONNECTED", "DISCONNECTED_FROM_BROKER"):
-                        await set_metaapi_connection_state(
-                            status,
-                            "MetaApi account status monitor detected the disconnection."
-                        )
-
-                    elif status == "CONNECTED":
-                        if connection is None:
-                            await set_metaapi_connection_state(
-                                "LOST",
-                                "MetaApi account reports CONNECTED but the RPC connection object is unavailable."
-                            )
-                            await ensure_metaapi_connection()
-                        else:
-                            account_error = None
-                            symbol_error = None
-
-                            # First test the account RPC, but retry the SAME
-                            # request before treating it as a connection failure.
-                            try:
-                                await _rpc_account_information_with_retry(
-                                    connection,
-                                    attempts=2,
-                                    timeout=10
-                                )
-
-                                await set_metaapi_connection_state("CONNECTED")
-
-                            except asyncio.CancelledError:
-                                raise
-
-                            except Exception as account_rpc_error:
-                                account_error = account_rpc_error
-
-                                print()
-                                print("⚠️ ACCOUNT RPC HEALTH CHECK FAILED")
-                                print(
-                                    f"   Error: {type(account_error).__name__}: {account_error}"
-                                )
-                                print("🔎 TESTING SYMBOL RPC BEFORE DECLARING METAAPI LOST...")
-
-                                # A different RPC succeeding means the socket
-                                # is still usable. Keep it alive.
-                                try:
-                                    await _rpc_symbol_price_with_retry(
-                                        connection,
-                                        attempts=2,
-                                        timeout=10
-                                    )
-
-                                    await set_metaapi_connection_state("CONNECTED")
-                                    print(
-                                        "🟢 SYMBOL RPC HEALTHY - ACCOUNT RPC TIMEOUT TREATED AS TRANSIENT"
-                                    )
-                                    print(
-                                        "   Existing MetaApi RPC connection will be kept."
-                                    )
-
-                                except asyncio.CancelledError:
-                                    raise
-
-                                except Exception as symbol_rpc_error:
-                                    symbol_error = symbol_rpc_error
-
-                                    print()
-                                    print("🔴 BOTH RPC HEALTH CHECKS FAILED")
-                                    print(
-                                        f"   Account RPC: {type(account_error).__name__}: {account_error}"
-                                    )
-                                    print(
-                                        f"   Symbol RPC:  {type(symbol_error).__name__}: {symbol_error}"
-                                    )
-                                    print("   Rebuilding MetaApi RPC connection...")
-
-                                    await set_metaapi_connection_state(
-                                        "LOST",
-                                        "Repeated RPC failures: "
-                                        f"account RPC={type(account_error).__name__}: {account_error}; "
-                                        f"symbol RPC={type(symbol_error).__name__}: {symbol_error}"
-                                    )
-
-                                    recovered = await ensure_metaapi_connection()
-
-                                    if recovered:
-                                        print(
-                                            "🟢 MetaApi monitor recovered the RPC connection."
-                                        )
-
+            await ensure_metaapi_connection()
         except asyncio.CancelledError:
             raise
-
         except Exception as error:
-            print(
-                f"⚠️ MetaApi connection monitor error: {type(error).__name__}: {error}"
-            )
+            print(f"⚠️ Local MT5 API monitor error: {error}")
+        await asyncio.sleep(CONNECTION_STATUS_CHECK_SECONDS)
 
-        await asyncio.sleep(
-            CONNECTION_STATUS_CHECK_SECONDS
-        )
+
+async def verify_symbol():
+    quote = await api_request("GET", f"/symbols/{SYMBOL}/quote")
+    print(f"✅ {SYMBOL} available through local MT5 API; digits={quote.get('digits')}; API volume fixed at 0.01")
+    return quote
+
+
+async def get_current_price():
+    quote = await api_request("GET", f"/symbols/{SYMBOL}/quote")
+    if quote.get("bid") is None or quote.get("ask") is None:
+        raise RuntimeError(f"Could not obtain local MT5 quote: {quote}")
+    return float(quote["bid"]), float(quote["ask"])
+
 
 async def get_current_price_with_recovery(valid_until=None):
-    """Get the live price while tolerating transient symbol RPC timeouts."""
+    if not await ensure_metaapi_connection(valid_until):
+        return None
+    try:
+        return await get_current_price()
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        print(f"⚠️ Local MT5 quote failed: {error}")
+        await set_metaapi_connection_state("LOST", str(error))
+        return None
 
-    global metaapi_operation_lock
 
-    if metaapi_operation_lock is None:
-        metaapi_operation_lock = asyncio.Lock()
+def normalise_api_position(raw):
+    raw = dict(raw or {})
+    ticket = raw.get("ticket")
+    pid = raw.get("position_id", raw.get("identifier", ticket))
+    raw.update({"id": str(pid if pid is not None else ticket),
+        "positionId": str(pid if pid is not None else ticket), "position_id": pid,
+        "identifier": pid, "originalComment": raw.get("comment", ""),
+        "clientId": raw.get("comment", ""), "openPrice": raw.get("price_open"),
+        "currentPrice": raw.get("price_current"), "stopLoss": raw.get("sl"),
+        "takeProfit": raw.get("tp"),
+        "type": "POSITION_TYPE_BUY" if raw.get("type") == 0 else "POSITION_TYPE_SELL"})
+    return raw
 
-    async with metaapi_operation_lock:
 
-        connected = await ensure_metaapi_connection(valid_until)
-        if not connected:
-            return None
+async def get_api_positions():
+    data = await api_request("GET", "/positions")
+    return [normalise_api_position(p) for p in data.get("positions", [])]
 
-        # Retry the SAME quote request before rebuilding the RPC socket.
-        try:
-            bid, ask = await _rpc_symbol_price_with_retry(
-                connection,
-                attempts=2,
-                timeout=10
-            )
-            return bid, ask
 
-        except asyncio.CancelledError:
-            raise
+async def get_position_close_information(position_id):
+    try:
+        history = await api_request("GET", f"/history/positions/{int(position_id)}", params={"days": 90})
+    except Exception as error:
+        print(f"⚠️ Could not get deal history for {position_id}: {error}")
+        return None
+    deals = history.get("deals", [])
+    if not deals or not history.get("closed"):
+        return None
+    closes = [d for d in deals if d.get("entry") in {1, 2, 3}]
+    if not closes:
+        return None
+    gross = sum(float(d.get("profit", 0) or 0) for d in closes)
+    costs = sum(float(d.get("commission", 0) or 0)+float(d.get("swap", 0) or 0)+float(d.get("fee", 0) or 0) for d in deals)
+    reasons = " ".join(str(d.get("reason", "")).upper() for d in closes)
+    reason = "SL" if ("SL" in reasons or "STOP_LOSS" in reasons or gross < 0) else "TP" if ("TP" in reasons or "TAKE_PROFIT" in reasons or gross > 0) else "UNKNOWN"
+    return {"close_reason": reason, "profit": gross+costs, "close_time": str(closes[-1].get("time") or history.get("close_time") or now_iso()), "close_deals": len(closes)}
 
-        except Exception as first_error:
 
-            print()
-            print("⚠️ LIVE PRICE RPC RETRIES EXHAUSTED")
-            print(
-                f"   Symbol RPC error: {type(first_error).__name__}: {first_error}"
-            )
-            print("🔎 VALIDATING ACCOUNT RPC BEFORE REBUILDING...")
-
-            # The quote request can fail while the account RPC remains healthy.
-            try:
-                await _rpc_account_information_with_retry(
-                    connection,
-                    attempts=2,
-                    timeout=10
-                )
-
-                await set_metaapi_connection_state("CONNECTED")
-                print(
-                    "🟢 ACCOUNT RPC IS HEALTHY - KEEPING EXISTING RPC CONNECTION"
-                )
-                print(
-                    "   Symbol quote failure was treated as a transient request failure."
-                )
-                return None
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as account_error:
-
-                print()
-                print("🔴 SYMBOL AND ACCOUNT RPC HEALTH CHECKS FAILED")
-                print(
-                    f"   Symbol RPC:  {type(first_error).__name__}: {first_error}"
-                )
-                print(
-                    f"   Account RPC: {type(account_error).__name__}: {account_error}"
-                )
-
-                await set_metaapi_connection_state(
-                    "LOST",
-                    "Repeated RPC failures: "
-                    f"symbol RPC={type(first_error).__name__}: {first_error}; "
-                    f"account RPC={type(account_error).__name__}: {account_error}"
-                )
-
-                recovered = await ensure_metaapi_connection(valid_until)
-
-                if not recovered:
-                    return None
-
-                # After a real RPC rebuild, give the quote one final bounded
-                # retry. This does not submit or duplicate any trade.
-                try:
-                    bid, ask = await _rpc_symbol_price_with_retry(
-                        connection,
-                        attempts=2,
-                        timeout=10
-                    )
-                    await set_metaapi_connection_state("CONNECTED")
-                    print("🟢 LIVE PRICE RECOVERED AFTER RPC REBUILD")
-                    return bid, ask
-
-                except asyncio.CancelledError:
-                    raise
-
-                except Exception as second_error:
-                    print("❌ LIVE PRICE RETRY FAILED AFTER RPC REBUILD")
-                    print(
-                        f"   {type(second_error).__name__}: {second_error}"
-                    )
-                    await set_metaapi_connection_state(
-                        "LOST",
-                        f"Quote retry after RPC rebuild failed: {type(second_error).__name__}: {second_error}"
-                    )
-                    return None
-
-# ============================================================
 # CALCULATE EXTENDED RANGE
 # ============================================================
 
@@ -2271,73 +1739,16 @@ async def notify_position_closed(
 # EXECUTE TWO POSITIONS
 # ============================================================
 
-async def find_existing_signal_position(
-    signal_id,
-    position_number,
-    client_id
-):
-
+async def find_existing_signal_position(signal_id, position_number, client_id):
     if not await ensure_metaapi_connection():
         return None
-
-    positions = await connection.get_positions()
-
-    for position in positions or []:
-
-        symbol = str(
-            get_field(position, "symbol", "")
-        )
-
-        if symbol != SYMBOL:
-            continue
-
-        comment = str(
-            get_field(position, "comment", "")
-        )
-        original_comment = str(
-            get_field(position, "originalComment", "")
-        )
-        position_client_id = str(
-            get_field(position, "clientId", "")
-        )
-
-        _, marker = build_trade_identifiers(
-            signal_id,
-            position_number
-        )
-
-        if (
-            client_id in position_client_id
-            or marker in comment
-            or marker in original_comment
-        ):
-            return position
-
+    _, marker = build_trade_identifiers(signal_id, position_number)
+    for p in await get_api_positions():
+        if p.get("symbol") == SYMBOL and marker == str(p.get("comment", "")):
+            return p
     return None
 
 
-def build_trade_identifiers(signal_id, position_number):
-    """Build short MetaApi identifiers that stay within broker/API limits.
-
-    MetaApi validates the comment/clientId fields before sending the order.
-    The previous identifiers embedded the full Phase 4 signal ID and became
-    too long.  Phase 4 signal IDs currently end with a compact numeric
-    sequence (for example SIG-1003170522699-207), so the final sequence is
-    sufficient for the demo pipeline and keeps both fields very short.
-    """
-    raw_signal_id = str(signal_id or "UNKNOWN")
-    parts = raw_signal_id.split("-")
-    compact_signal_id = parts[-1] if parts and parts[-1] else raw_signal_id
-
-    # Keep only safe characters and cap the compact portion so the resulting
-    # MetaApi identifiers remain comfortably below the documented limits.
-    compact_signal_id = re.sub(r"[^A-Za-z0-9]", "", compact_signal_id) or "0"
-    compact_signal_id = compact_signal_id[-12:]
-
-    client_id = f"P6_{compact_signal_id}_P{position_number}"
-    marker = f"P6:{compact_signal_id}:P{position_number}"
-
-    return client_id, marker
 
 
 def build_position_record(
@@ -2394,509 +1805,79 @@ async def execute_signal(
         )
 
 
-async def _execute_signal_locked(
-    signal,
-    execution_price
-):
-
-    direction = signal["direction"]
+async def _execute_signal_locked(signal, execution_price):
+    """Execute two fixed 0.01-lot demo positions through the local FastAPI API."""
+    direction = str(signal["direction"]).upper()
     positions = []
-
-    selected_tps = signal[
-        "execution_tp_numbers"
-    ][:POSITIONS_PER_SIGNAL]
-
-    if len(selected_tps) < POSITIONS_PER_SIGNAL:
-        raise RuntimeError(
-            "Phase 4 did not provide enough execution TPs."
-        )
-
-    # Preserve positions already opened by an earlier successful request.
-    existing_records = {
-        p["position_number"]: p
-        for p in signal.get("positions", [])
-        if p.get("position_id") and not p.get("closed", False)
-    }
-
-    for position_number, tp_number in enumerate(
-        selected_tps,
-        start=1
-    ):
-
-        tp_price = signal["execution_tps"][tp_number]
-        client_id, marker = build_trade_identifiers(
-            signal["signal_id"],
-            position_number
-        )
-
-        print()
-        print("-" * 70)
-        print(f"🚀 EXECUTING POSITION {position_number}")
-        print(f"Direction: {direction}")
-        print(f"Symbol:    {SYMBOL}")
-        print(f"Volume:    {LOT_SIZE}")
-        print(f"SL:        {signal['stoploss']}")
-        print(f"TP{tp_number}:      {tp_price}")
-
-        # Duplicate protection: inspect MT5 before every new order.
+    tps = signal["execution_tp_numbers"][:POSITIONS_PER_SIGNAL]
+    if len(tps) < POSITIONS_PER_SIGNAL:
+        raise RuntimeError("Phase 4 did not provide enough execution TPs.")
+    if abs(float(LOT_SIZE)-0.01) > 1e-9:
+        raise RuntimeError("Phase 6 LOT_SIZE must be 0.01; the API enforces 0.01 lots.")
+    for n, tp_number in enumerate(tps, start=1):
+        tp = float(signal["execution_tps"][tp_number])
+        client_id, marker = build_trade_identifiers(signal["signal_id"], n)
+        print("\n" + "-"*70 + f"\n🚀 EXECUTING POSITION {n}\nDirection: {direction}\nSymbol: {SYMBOL}\nVolume: 0.01 (API fixed)\nSL: {signal['stoploss']}\nTP{tp_number}: {tp}")
         try:
-            existing = await find_existing_signal_position(
-                signal["signal_id"],
-                position_number,
-                client_id
-            )
-
-            if existing is not None:
-                print(
-                    f"🛡️ Existing position found for "
-                    f"{signal['signal_id']} / Position {position_number}. "
-                    "No duplicate order will be sent."
-                )
-                record = build_position_record(
-                    position_number,
-                    tp_number,
-                    tp_price,
-                    existing
-                )
-                positions.append(record)
-
-                await send_notification(
-                    "🛡️ EXISTING POSITION FOUND - NO DUPLICATE ORDER\n\n"
-                    f"Signal ID: {signal['signal_id']}\n"
-                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
-                    f"TP{tp_number}: {tp_price}\n"
-                    f"Existing position: {existing}"
-                )
-
+            existing = await find_existing_signal_position(signal["signal_id"], n, client_id)
+            if existing:
+                positions.append(build_position_record(n, tp_number, tp, existing, "EXISTING_POSITION_CONFIRMED"))
                 continue
-
         except Exception as error:
-            print(
-                f"⚠️ Could not perform duplicate check: {error}"
-            )
+            print(f"⚠️ Existing-position reconciliation failed: {error}")
             return False, positions
-
+        if not await ensure_metaapi_connection(signal.get("valid_until")):
+            return False, positions
         try:
-            connected = await ensure_metaapi_connection(
-                signal.get("valid_until")
-            )
-            if not connected:
-                return False, positions
-
-            options = {
-                "comment": marker,
-                "clientId": client_id,
-            }
-
-            # ----------------------------------------------------
-            # DEEP METAAPI ORDER DIAGNOSTICS
-            # ----------------------------------------------------
-            # Do not silently wait inside the SDK. We print every
-            # input, verify the live connection and price, then put
-            # a hard timeout around the actual order request.
-            # This does NOT change the trading decision or order
-            # parameters; it only makes the MetaApi boundary visible.
-            # ----------------------------------------------------
-
-            print()
-            print("🔬 DEEP METAAPI EXECUTION DIAGNOSTICS")
-            print("   --------------------------------------------------")
-            print(f"   Position number: {position_number}")
-            print(f"   Direction:       {direction}")
-            print(f"   Symbol:          {SYMBOL}")
-            print(f"   Volume:          {LOT_SIZE}")
-            print(f"   Stop loss:       {signal['stoploss']}")
-            print(f"   Take profit:     {tp_price}")
-            print(f"   Comment:         {marker}")
-            print(f"   Client ID:       {client_id}")
-            print(f"   Comment length:  {len(marker)}")
-            print(f"   Client ID length: {len(client_id)}")
-            print(f"   Combined length: {len(marker) + len(client_id)}")
-            print(f"   Connection obj:  {type(connection).__name__}")
-            print(f"   Connection state: {metaapi_connection_state}")
-
-            await send_notification(
-                "🔬 METAAPI ORDER DIAGNOSTICS\n\n"
-                f"Signal ID: {signal['signal_id']}\n"
-                f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
-                f"Direction: {direction}\n"
-                f"Symbol: {SYMBOL}\n"
-                f"Volume: {LOT_SIZE}\n"
-                f"SL: {signal['stoploss']}\n"
-                f"TP{tp_number}: {tp_price}\n"
-                f"Execution price: {execution_price:.3f}\n"
-                f"Comment: {marker}\n"
-                f"Client ID: {client_id}\n"
-                f"Connection state: {metaapi_connection_state}\n"
-                "Checking account and live quote before order."
-            )
-
-            # Verify the account state immediately before sending.
-            try:
-                print("   🔎 Checking MetaApi account information...")
-                account_info = await asyncio.wait_for(
-                    connection.get_account_information(),
-                    timeout=10
-                )
-                print("   ✅ Account information returned")
-                print(f"      Broker: {get_field(account_info, 'broker', 'Unknown')}")
-                print(f"      Server: {get_field(account_info, 'server', 'Unknown')}")
-                print(f"      State: {get_field(account_info, 'state', 'Unknown')}")
-                print(f"      Connection status: {get_field(account_info, 'connectionStatus', get_field(account_info, 'connection_status', 'Unknown'))}")
-            except Exception as account_error:
-                print("   ⚠️ Account information diagnostic failed:")
-                print(f"      {type(account_error).__name__}: {account_error}")
-                print("      Continuing to the order request because the existing connection check passed.")
-
-            # Verify the live quote immediately before sending.
-            try:
-                print("   🔎 Checking live XAUUSD_i price...")
-                live_price = await asyncio.wait_for(
-                    connection.get_symbol_price(SYMBOL),
-                    timeout=10
-                )
-                print("   ✅ Live price returned")
-                print(f"      Bid: {get_field(live_price, 'bid', 'Unknown')}")
-                print(f"      Ask: {get_field(live_price, 'ask', 'Unknown')}")
-                print(f"      Time: {get_field(live_price, 'time', get_field(live_price, 'brokerTime', 'Unknown'))}")
-            except Exception as price_error:
-                print("   ⚠️ Live price diagnostic failed:")
-                print(f"      {type(price_error).__name__}: {price_error}")
-
-            print()
-            print("🚨 METAAPI ORDER REQUEST ABOUT TO BE SENT")
-            print("   ==================================================")
-            print("   This is the exact point where the previous run stopped.")
-            print("   Waiting up to 30 seconds for MetaApi response...")
-            print("   ==================================================")
-
-            await send_notification(
-                "📤 METAAPI ORDER REQUEST SENT\n\n"
-                f"Signal ID: {signal['signal_id']}\n"
-                f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
-                f"Direction: {direction}\n"
-                f"Symbol: {SYMBOL}\n"
-                f"Volume: {LOT_SIZE}\n"
-                f"SL: {signal['stoploss']}\n"
-                f"TP{tp_number}: {tp_price}\n"
-                f"Execution price: {execution_price:.3f}\n"
-                "Waiting up to 30 seconds for MetaApi response."
-            )
-
-            order_started = datetime.now(timezone.utc)
-
-            try:
-                if direction == "BUY":
-                    result = await asyncio.wait_for(
-                        connection.create_market_buy_order(
-                            SYMBOL,
-                            LOT_SIZE,
-                            signal["stoploss"],
-                            tp_price,
-                            options
-                        ),
-                        timeout=30
-                    )
-                else:
-                    result = await asyncio.wait_for(
-                        connection.create_market_sell_order(
-                            SYMBOL,
-                            LOT_SIZE,
-                            signal["stoploss"],
-                            tp_price,
-                            options
-                        ),
-                        timeout=30
-                    )
-
-                elapsed = (datetime.now(timezone.utc) - order_started).total_seconds()
-                print()
-                print("📨 METAAPI ORDER RESPONSE RECEIVED")
-                print(f"   Response time: {elapsed:.3f} seconds")
-                print(f"   Response type: {type(result).__name__}")
-                print(f"   Raw response:  {result!r}")
-
-                await send_notification(
-                    "📨 METAAPI ORDER RESPONSE RECEIVED\n\n"
-                    f"Signal ID: {signal['signal_id']}\n"
-                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
-                    f"Response time: {elapsed:.3f}s\n"
-                    f"Result code: {get_field(result, 'stringCode', 'UNKNOWN')}\n"
-                    f"Position ID: {get_field(result, 'positionId', get_field(result, 'position_id', 'UNKNOWN'))}\n"
-                    f"Raw result: {result!r}"
-                )
-
-            except asyncio.TimeoutError:
-                elapsed = (datetime.now(timezone.utc) - order_started).total_seconds()
-                print()
-                print("⏰ METAAPI ORDER REQUEST TIMED OUT")
-                print(f"   Waited: {elapsed:.3f} seconds")
-                print("   IMPORTANT: the broker may still have received the order.")
-                print("   Checking MT5 for the position before allowing any retry.")
-
-                await send_notification(
-                    "⏰ METAAPI ORDER REQUEST TIMED OUT\n\n"
-                    f"Signal ID: {signal['signal_id']}\n"
-                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
-                    f"Waited: {elapsed:.3f}s\n"
-                    "Phase 6 will verify MT5 before retrying."
-                )
-
-                try:
-                    await asyncio.sleep(1)
-                    confirmed = await asyncio.wait_for(
-                        find_existing_signal_position(
-                            signal["signal_id"],
-                            position_number,
-                            client_id
-                        ),
-                        timeout=15
-                    )
-                    if confirmed is not None:
-                        print("🛡️ POSITION FOUND AFTER METAAPI TIMEOUT")
-                        print(f"   Position: {confirmed}")
-                        positions.append(
-                            build_position_record(
-                                position_number,
-                                tp_number,
-                                tp_price,
-                                confirmed,
-                                "METAAPI_TIMEOUT_BUT_POSITION_CONFIRMED"
-                            )
-                        )
-                        continue
-                    print("❌ No matching MT5 position found after timeout.")
-                except Exception as verify_error:
-                    print("❌ Post-timeout verification also failed:")
-                    print(f"   {type(verify_error).__name__}: {verify_error}")
-
-                return False, positions
-
-            except Exception as order_error:
-                elapsed = (datetime.now(timezone.utc) - order_started).total_seconds()
-                print()
-                print("❌ METAAPI ORDER REQUEST RAISED AN EXCEPTION")
-                print(f"   Elapsed: {elapsed:.3f} seconds")
-                print(f"   Exception type: {type(order_error).__name__}")
-                print(f"   Exception: {order_error}")
-
-                await send_notification(
-                    "❌ METAAPI ORDER REQUEST FAILED\n\n"
-                    f"Signal ID: {signal['signal_id']}\n"
-                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
-                    f"Exception type: {type(order_error).__name__}\n"
-                    f"Exception: {order_error}\n"
-                    f"Details: {getattr(order_error, 'details', None)!r}"
-                )
-
-                # MetaApi ValidationException instances can contain the
-                # broker/API reason in `details`. Print it explicitly so a
-                # future rejection is diagnosable without guessing.
-                error_details = getattr(order_error, "details", None)
-                if error_details is not None:
-                    print(f"   Error details: {error_details!r}")
-
-                # The SDK may expose a richer formatter on the MetaApi
-                # client. Use it when available, but never let diagnostics
-                # hide the original exception.
-                try:
-                    formatter = getattr(api, "format_error", None)
-                    if callable(formatter):
-                        print("   Formatted MetaApi error:")
-                        print(f"      {formatter(order_error)}")
-                except Exception as format_error:
-                    print(
-                        "   ⚠️ Could not format MetaApi error: "
-                        f"{type(format_error).__name__}: {format_error}"
-                    )
-
-                print("   Full traceback follows:")
-                import traceback
-                traceback.print_exc()
-
-                print("🔎 Checking MT5 for a position despite the exception...")
-                try:
-                    await asyncio.sleep(1)
-                    confirmed = await asyncio.wait_for(
-                        find_existing_signal_position(
-                            signal["signal_id"],
-                            position_number,
-                            client_id
-                        ),
-                        timeout=15
-                    )
-                    if confirmed is not None:
-                        print("🛡️ POSITION FOUND DESPITE METAAPI EXCEPTION")
-                        print(f"   Position: {confirmed}")
-                        positions.append(
-                            build_position_record(
-                                position_number,
-                                tp_number,
-                                tp_price,
-                                confirmed,
-                                "METAAPI_EXCEPTION_BUT_POSITION_CONFIRMED"
-                            )
-                        )
-                        continue
-                    print("❌ No matching MT5 position found.")
-                except Exception as verify_error:
-                    print("❌ Verification after MetaApi exception failed:")
-                    print(f"   {type(verify_error).__name__}: {verify_error}")
-
-                return False, positions
-
-            print()
-            print("📨 MetaApi result:")
-            print(result)
-
-            result_code = get_field(
-                result,
-                "stringCode",
-                ""
-            )
-
-            position_id = get_field(
-                result,
-                "positionId",
-                None
-            ) or get_field(
-                result,
-                "position_id",
-                None
-            )
-
-            if result_code not in (
-                "TRADE_RETCODE_DONE",
-                "TRADE_RETCODE_PLACED",
-                ""
-            ):
-                print(
-                    f"❌ POSITION {position_number} FAILED - "
-                    f"MetaApi code: {result_code}"
-                )
-
-                await send_notification(
-                    "❌ POSITION REJECTED BY METAAPI\n\n"
-                    f"Signal ID: {signal['signal_id']}\n"
-                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
-                    f"MetaApi result code: {result_code}\n"
-                    f"Raw result: {result!r}"
-                )
-
-                return False, positions
-
-            # Confirm the position really exists before considering the
-            # order successful. This also protects against a lost response.
-            await asyncio.sleep(1)
-            confirmed = await find_existing_signal_position(
-                signal["signal_id"],
-                position_number,
-                client_id
-            )
-
-            if confirmed is None:
-                print(
-                    f"⚠️ POSITION {position_number} order response was received, "
-                    "but MT5 position verification failed."
-                )
-
-                await send_notification(
-                    "⚠️ ORDER RESPONSE RECEIVED BUT MT5 VERIFICATION FAILED\n\n"
-                    f"Signal ID: {signal['signal_id']}\n"
-                    f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
-                    "Phase 6 will not blindly duplicate the order."
-                )
-
-                return False, positions
-
-            if not position_id:
-                position_id = get_field(
-                    confirmed,
-                    "id",
-                    None
-                ) or get_field(
-                    confirmed,
-                    "positionId",
-                    None
-                )
-
-            print(
-                f"✅ POSITION {position_number} EXECUTED AND VERIFIED"
-            )
-            print(
-                f"   Position ID: {position_id or 'Unknown'}"
-            )
-
-            await send_notification(
-                "✅ POSITION EXECUTED AND VERIFIED\n\n"
-                f"Signal ID: {signal['signal_id']}\n"
-                f"Position: {position_number}/{POSITIONS_PER_SIGNAL}\n"
-                f"TP{tp_number}: {tp_price}\n"
-                f"Position ID: {position_id or 'Unknown'}\n"
-                f"MetaApi result code: {result_code}"
-            )
-
-            positions.append({
-                "position_number": position_number,
-                "tp_number": tp_number,
-                "tp": tp_price,
-                "result_code": result_code,
-                "position_id": position_id,
-                "opened_at": now_iso(),
-                "close_reason": None,
-                "close_time": None,
-                "profit": None,
-                "closed": False,
-                "result": str(result),
-            })
-
+            result = await asyncio.wait_for(api_request("POST", "/demo/order", payload={
+                "request_id": marker, "side": direction,
+                "stop_loss": float(signal["stoploss"]), "take_profit": tp,
+            }), timeout=API_REQUEST_TIMEOUT_SECONDS+3)
+            if result.get("state") == "CONFIRMED" and result.get("result"):
+                result = result["result"]
+        except asyncio.CancelledError:
+            raise
         except Exception as error:
-
-            print()
-            print(
-                f"❌ POSITION {position_number} EXECUTION ERROR:"
-            )
-            print(error)
-
-            # A timeout can mean MT5 accepted the order but the response was
-            # lost. Check positions before allowing a future retry.
+            print(f"❌ Local API order result needs reconciliation: {error}")
+            await send_notification("⚠️ LOCAL API ORDER NEEDS RECONCILIATION\n\n"
+                f"Signal ID: {signal['signal_id']}\nPosition: {n}/{POSITIONS_PER_SIGNAL}\n"
+                f"Request ID: {marker}\nError: {error}\nNo automatic duplicate retry will be attempted.")
             try:
                 await asyncio.sleep(1)
-                confirmed = await find_existing_signal_position(
-                    signal["signal_id"],
-                    position_number,
-                    client_id
-                )
-                if confirmed is not None:
-                    print(
-                        f"🛡️ POSITION {position_number} was found in MT5 "
-                        "after the request error. Treating it as executed."
-                    )
-                    positions.append(
-                        build_position_record(
-                            position_number,
-                            tp_number,
-                            tp_price,
-                            confirmed
-                        )
-                    )
+                found = await find_existing_signal_position(signal["signal_id"], n, client_id)
+                if found:
+                    positions.append(build_position_record(n, tp_number, tp, found, "API_ERROR_BUT_POSITION_CONFIRMED"))
                     continue
             except Exception as verify_error:
-                print(
-                    f"⚠️ Post-error position verification failed: "
-                    f"{verify_error}"
-                )
-
+                print(f"⚠️ Reconciliation check failed: {verify_error}")
             return False, positions
+        if not result.get("execution_accepted"):
+            await send_notification("❌ LOCAL MT5 API REJECTED ORDER\n\n"
+                f"Signal ID: {signal['signal_id']}\nPosition: {n}/{POSITIONS_PER_SIGNAL}\nResult: {result!r}")
+            return False, positions
+        await asyncio.sleep(0.5)
+        found = await find_existing_signal_position(signal["signal_id"], n, client_id)
+        pid = result.get("position_id") or result.get("position_ticket")
+        if found is None:
+            await send_notification("⚠️ ORDER ACCEPTED BUT POSITION NOT VISIBLE\n\n"
+                f"Signal ID: {signal['signal_id']}\nRequest ID: {marker}\nNo duplicate retry will be attempted.")
+            if not pid:
+                return False, positions
+            found = {"id": str(pid), "positionId": str(pid), "position_id": pid, "comment": marker, "symbol": SYMBOL}
+        pid = found.get("position_id") or found.get("identifier") or pid or found.get("ticket") or found.get("id")
+        rec = build_position_record(n, tp_number, tp, found, str(result.get("retcode", "TRADE_RETCODE_DONE")))
+        rec["position_id"] = pid
+        rec["request_id"] = marker
+        rec["result"] = str(result)
+        positions.append(rec)
+        await send_notification("✅ POSITION EXECUTED THROUGH LOCAL MT5 API\n\n"
+            f"Signal ID: {signal['signal_id']}\nPosition: {n}/{POSITIONS_PER_SIGNAL}\nTP{tp_number}: {tp}\n"
+            f"Position ID: {pid or 'Unknown'}\nVolume: 0.01 lot\nMode: DEMO ONLY")
+    return len(positions) == POSITIONS_PER_SIGNAL, positions
 
-    return (
-        len(positions) == POSITIONS_PER_SIGNAL,
-        positions
-    )
 
 
 
-# ============================================================
 # RECORD SIGNAL EXECUTION
 # ============================================================
 
@@ -3289,19 +2270,10 @@ async def monitor_position(
 
         try:
 
-            open_position = (
-                await connection
-                .get_position(
-                    position_id
-                )
-            )
-
-            if open_position:
-
-                await asyncio.sleep(
-                    PRICE_CHECK_INTERVAL_SECONDS
-                )
-
+            open_positions = await get_api_positions()
+            is_open = any(str(p.get("position_id") or p.get("identifier") or p.get("ticket") or p.get("id")) == str(position_id) for p in open_positions)
+            if is_open:
+                await asyncio.sleep(PRICE_CHECK_INTERVAL_SECONDS)
                 continue
 
         except Exception as error:
@@ -4642,19 +3614,8 @@ async def main():
             "is missing."
         )
 
-    if not METAAPI_TOKEN:
-
-        raise RuntimeError(
-            "METAAPI_TOKEN "
-            "is missing."
-        )
-
-    if not METAAPI_ACCOUNT_ID:
-
-        raise RuntimeError(
-            "METAAPI_ACCOUNT_ID "
-            "is missing."
-        )
+    if not EXECUTION_API_KEY:
+        raise RuntimeError("EXECUTION_API_KEY is missing. Set it locally; never commit it.")
 
     # --------------------------------------------------------
     # MEMORY
@@ -4663,170 +3624,26 @@ async def main():
     load_runtime_memory()
 
     # ========================================================
-    # METAAPI
+    # LOCAL FASTAPI / MT5 CONNECTION
     # ========================================================
-
-    print()
-    print(
-        "=" * 70
-    )
-
-    print(
-        "CONNECTING TO METAAPI"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    metaapi = MetaApi(
-        METAAPI_TOKEN
-    )
-
-    print(
-        "✅ MetaApi SDK initialized"
-    )
-
-    account = (
-        await metaapi
-        .metatrader_account_api
-        .get_account(
-            METAAPI_ACCOUNT_ID
-        )
-    )
-
-    account_name = get_field(
-        account,
-        "name",
-        METAAPI_ACCOUNT_ID
-    )
-
-    account_server = get_field(
-        account,
-        "server",
-        "Unknown"
-    )
-
-    account_state = get_field(
-        account,
-        "state",
-        "Unknown"
-    )
-
-    print(
-        f"✅ Account found: "
-        f"{account_name}"
-    )
-
-    print(
-        f"   Server: "
-        f"{account_server}"
-    )
-
-    print(
-        f"   State: "
-        f"{account_state}"
-    )
-
-    # --------------------------------------------------------
-    # SAFETY CHECK
-    # --------------------------------------------------------
-
-    server_text = str(
-        account_server
-    ).lower()
-
-    if "demo" not in server_text:
-
-        raise RuntimeError(
-
-            "🛑 SAFETY STOP: "
-            "Configured MetaApi account "
-            "does not appear to be a "
-            "DEMO account."
-        )
-
-    print(
-        "🟢 DEMO ACCOUNT CONFIRMED"
-    )
-
-    # --------------------------------------------------------
-    # DEPLOY ACCOUNT IF NECESSARY
-    # --------------------------------------------------------
-
-    if str(
-        account_state
-    ).upper() != "DEPLOYED":
-
-        print(
-            "⏳ Deploying MetaApi account..."
-        )
-
-        await account.deploy()
-
-    # --------------------------------------------------------
-    # WAIT FOR CONNECTION
-    # --------------------------------------------------------
-
-    print(
-        "⏳ Waiting for MT5 connection..."
-    )
-
-    await account.wait_connected()
-
-    print(
-        "✅ MT5 ACCOUNT CONNECTED"
-    )
-
-    # --------------------------------------------------------
-    # RPC CONNECTION
-    # --------------------------------------------------------
-
-    connection = (
-        account.get_rpc_connection()
-    )
-
-    await connection.connect()
-
-    print(
-        "✅ RPC connection established"
-    )
-
-    # --------------------------------------------------------
-    # SYNCHRONIZATION
-    # --------------------------------------------------------
-
-    await connection.wait_synchronized()
-
-    print(
-        "✅ MT5 ACCOUNT SYNCHRONIZED"
-    )
-
+    print("\n" + "="*70 + "\nCONNECTING TO LOCAL FASTAPI -> MT5\n" + "="*70)
+    print(f"API URL: {EXECUTION_API_URL}\nAPI key: configured (hidden)")
+    api_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_REQUEST_TIMEOUT_SECONDS))
+    health = await api_request("GET", "/health")
+    if not health.get("mt5_connected") or not health.get("account_authenticated"):
+        raise RuntimeError(f"Local API reports MT5 unavailable: {health}")
+    account = await api_request("GET", "/account")
+    if not account.get("is_demo"):
+        raise RuntimeError("SAFETY STOP: local MT5 account is not a DEMO account.")
+    if not account.get("trade_allowed"):
+        raise RuntimeError("SAFETY STOP: MT5 account trading is disabled.")
+    print(f"✅ Demo account confirmed: {account.get('company')} / {account.get('server')}")
     metaapi_connection_lock = asyncio.Lock()
     metaapi_operation_lock = asyncio.Lock()
-
-    # Read the broker/application connection status explicitly.
-    refreshed_account = await refresh_metaapi_account()
-    initial_status = str(
-        get_field(
-            refreshed_account,
-            "connectionStatus",
-            get_field(refreshed_account, "connection_status", "UNKNOWN")
-        )
-    ).upper() if refreshed_account is not None else "UNKNOWN"
-
-    print(
-        f"🔎 MetaApi connectionStatus: {initial_status}"
-    )
-
-    if initial_status == "CONNECTED":
-        metaapi_connection_state = "CONNECTED"
-
-    # --------------------------------------------------------
-    # SYMBOL
-    # --------------------------------------------------------
-
+    await set_metaapi_connection_state("CONNECTED")
     await verify_symbol()
+
+
 
     # ========================================================
     # TELEGRAM
@@ -5143,9 +3960,8 @@ async def main():
             task.cancel()
 
         try:
-
-            if connection is not None:
-                await connection.close()
+            if api_session is not None and not api_session.closed:
+                await api_session.close()
         except Exception:
             pass
 
