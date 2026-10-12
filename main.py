@@ -5,6 +5,7 @@ import json
 import hashlib
 import sqlite3
 import threading
+import re
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
@@ -250,6 +251,7 @@ def get_positions():
         "positions": [
             {
                 "ticket": p.ticket,
+                "position_id": int(getattr(p, "identifier", p.ticket)),
                 "symbol": p.symbol,
                 "type": p.type,
                 "volume": p.volume,
@@ -299,14 +301,18 @@ def place_demo_order(request: DemoOrderRequest):
         raise HTTPException(status_code=422, detail="side must be BUY or SELL")
 
     with _request_lock:
-        # MT5 comments are limited in length, so derive a stable, collision-resistant tag.
-        comment_tag = "GR-" + hashlib.sha256(request.request_id.encode("utf-8")).hexdigest()[:27]
+        # Use Phase 6's stable short marker directly when it fits MT5's comment limit.
+        # Longer arbitrary request IDs use a deterministic hash to avoid truncation collisions.
+        if len(request.request_id) <= 31 and re.fullmatch(r"[A-Za-z0-9:_-]+", request.request_id):
+            comment_tag = request.request_id
+        else:
+            comment_tag = "GR-" + hashlib.sha256(request.request_id.encode("utf-8")).hexdigest()[:27]
         previous = get_execution_request(request.request_id)
         if previous:
-            if previous["state"] == "CONFIRMED" and previous.get("response_json"):
+            if previous["state"] in ("CONFIRMED", "REJECTED") and previous.get("response_json"):
                 return {
                     "duplicate": True,
-                    "state": "CONFIRMED",
+                    "state": previous["state"],
                     "result": json.loads(previous["response_json"]),
                 }
             # An in-flight request may have executed before a crash/timeout.
@@ -462,6 +468,13 @@ def place_demo_order(request: DemoOrderRequest):
             ),
         }
 
+        # Reconcile the accepted order to its stable MT5 position identifier if it is already visible.
+        if response["execution_accepted"]:
+            reconciled = find_mt5_execution_by_comment(comment_tag)
+            if reconciled.get("found"):
+                response["position_ticket"] = reconciled.get("ticket")
+                response["position_id"] = reconciled.get("position_id")
+                response["reconciled"] = True
         # Persist the final result so process restarts do not erase idempotency history.
         state = "CONFIRMED" if response["execution_accepted"] else "REJECTED"
         save_execution_request(request.request_id, state, comment_tag, response)
@@ -501,6 +514,11 @@ def get_deal_history(position_id: int | None = None, days: int = 30, limit: int 
             "swap": float(getattr(d, "swap", 0.0)),
             "profit": float(getattr(d, "profit", 0.0)),
             "fee": float(getattr(d, "fee", 0.0)),
+            "reason": (
+                "SL" if getattr(d, "reason", None) == getattr(mt5, "DEAL_REASON_SL", -101)
+                else "TP" if getattr(d, "reason", None) == getattr(mt5, "DEAL_REASON_TP", -102)
+                else str(getattr(d, "reason", ""))
+            ),
             "magic": int(getattr(d, "magic", 0)),
             "comment": getattr(d, "comment", ""),
         })
