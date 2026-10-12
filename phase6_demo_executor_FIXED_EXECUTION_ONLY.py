@@ -3518,11 +3518,12 @@ async def status_heartbeat():
 
 async def main():
 
-    global metaapi
+    global api_session
     global account
-    global connection
     global telegram_client
     global metaapi_connection_lock
+    global metaapi_operation_lock
+    global metaapi_connection_state
 
     print()
     print(
