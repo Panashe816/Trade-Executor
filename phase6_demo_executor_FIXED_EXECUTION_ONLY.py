@@ -1065,9 +1065,14 @@ def read_phase4_execution_message(message, chat_id, message_id):
     stoploss = float(sl_match.group())
 
     signal_time = parse_phase4_datetime(signal_time_value)
-    valid_until = parse_phase4_datetime(valid_until_value)
-    if signal_time is None or valid_until is None:
+    if signal_time is None:
         return None
+
+    # Enforce a fixed two-hour lifetime from the original signal time.
+    if signal_time.tzinfo is None:
+        signal_time = signal_time.replace(tzinfo=CAT)
+
+    valid_until = signal_time + timedelta(hours=2)
 
     # Read the execution targets selected by Phase 4.
     execution_numbers = []
@@ -1315,21 +1320,22 @@ def signal_is_expired(
     signal
 ):
 
-    valid_until = parse_datetime(
-        signal.get(
-            "valid_until"
-        )
+    # Recalculate expiry from the original timestamp, including after restart.
+    signal_time = parse_phase4_datetime(
+        signal.get("signal_time")
     )
 
-    if not valid_until:
-
+    if not signal_time:
         return True
+
+    if signal_time.tzinfo is None:
+        signal_time = signal_time.replace(tzinfo=CAT)
+
+    valid_until = signal_time + timedelta(hours=2)
 
     return (
         now_utc()
-        >= valid_until.astimezone(
-            timezone.utc
-        )
+        >= valid_until.astimezone(timezone.utc)
     )
 
 
@@ -1739,6 +1745,16 @@ async def notify_position_closed(
 # EXECUTE TWO POSITIONS
 # ============================================================
 
+def build_trade_identifiers(signal_id, position_number):
+    """Return stable, MT5-comment-safe identifiers for one signal position."""
+    import hashlib
+
+    raw = f"{signal_id}:{int(position_number)}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+    marker = f"GR-{digest}"
+    return marker, marker
+
+
 async def find_existing_signal_position(signal_id, position_number, client_id):
     if not await ensure_metaapi_connection():
         return None
@@ -1815,7 +1831,9 @@ async def _execute_signal_locked(signal, execution_price):
     if abs(float(LOT_SIZE)-0.01) > 1e-9:
         raise RuntimeError("Phase 6 LOT_SIZE must be 0.01; the API enforces 0.01 lots.")
     for n, tp_number in enumerate(tps, start=1):
-        tp = float(signal["execution_tps"][tp_number])
+        tp_values = signal["execution_tps"]
+        tp_key = str(tp_number)
+        tp = float(tp_values[tp_key] if tp_key in tp_values else tp_values[tp_number])
         client_id, marker = build_trade_identifiers(signal["signal_id"], n)
         print("\n" + "-"*70 + f"\n🚀 EXECUTING POSITION {n}\nDirection: {direction}\nSymbol: {SYMBOL}\nVolume: 0.01 (API fixed)\nSL: {signal['stoploss']}\nTP{tp_number}: {tp}")
         try:
