@@ -24,7 +24,7 @@ from telethon.sessions import StringSession
 #          ↓
 # 30-PIP ENTRY EXTENSION
 #          ↓
-# METAAPI
+# LOCAL FASTAPI EXECUTION API
 #          ↓
 # MT5 DEMO ACCOUNT
 #
@@ -208,10 +208,10 @@ signal_status_report_times = {}
 STATUS_HEARTBEAT_SECONDS = 60
 SIGNAL_STATUS_REPORT_SECONDS = 30
 
-# MetaApi connection state tracking
-metaapi_connection_state = "UNKNOWN"
-metaapi_connection_lock = None
-metaapi_operation_lock = None
+# Execution API connection state tracking
+execution_api_connection_state = "UNKNOWN"
+execution_api_connection_lock = None
+execution_api_operation_lock = None
 
 
 # ============================================================
@@ -1154,7 +1154,7 @@ async def api_request(method, path, *, params=None, payload=None):
         return data
 
 
-async def refresh_metaapi_account():
+async def refresh_execution_api_account():
     global account
     try:
         account = await api_request("GET", "/account")
@@ -1164,12 +1164,12 @@ async def refresh_metaapi_account():
         return None
 
 
-async def set_metaapi_connection_state(state, reason=None):
-    global metaapi_connection_state
+async def set_execution_api_connection_state(state, reason=None):
+    global execution_api_connection_state
     normalized = str(state or "UNKNOWN").upper()
-    if normalized == metaapi_connection_state:
+    if normalized == execution_api_connection_state:
         return
-    metaapi_connection_state = normalized
+    execution_api_connection_state = normalized
     if normalized in ("DISCONNECTED", "DISCONNECTED_FROM_BROKER", "LOST"):
         print(f"\n🔴 LOCAL MT5 API CONNECTION LOST: {reason or normalized}")
         await send_notification("🔴 LOCAL MT5 API CONNECTION LOST\n\n"
@@ -1180,7 +1180,7 @@ async def set_metaapi_connection_state(state, reason=None):
         await send_notification("🟢 LOCAL MT5 API CONNECTION RESTORED\n\nLocal API and MT5 are responding.")
 
 
-async def ensure_metaapi_connection(valid_until=None):
+async def ensure_execution_api_connection(valid_until=None):
     attempt = 0
     while True:
         if valid_until:
@@ -1194,13 +1194,13 @@ async def ensure_metaapi_connection(valid_until=None):
             info = await api_request("GET", "/account")
             if not info.get("is_demo"):
                 raise RuntimeError("Safety stop: local MT5 account is not demo.")
-            await set_metaapi_connection_state("CONNECTED")
+            await set_execution_api_connection_state("CONNECTED")
             return True
         except asyncio.CancelledError:
             raise
         except Exception as error:
             attempt += 1
-            await set_metaapi_connection_state("LOST", str(error))
+            await set_execution_api_connection_state("LOST", str(error))
             delay = CONNECTION_RETRY_DELAYS_SECONDS[min(attempt-1, len(CONNECTION_RETRY_DELAYS_SECONDS)-1)]
             if valid_until:
                 expiry = parse_datetime(valid_until)
@@ -1213,10 +1213,10 @@ async def ensure_metaapi_connection(valid_until=None):
             await asyncio.sleep(delay)
 
 
-async def metaapi_connection_monitor():
+async def execution_api_connection_monitor():
     while True:
         try:
-            await ensure_metaapi_connection()
+            await ensure_execution_api_connection()
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -1238,7 +1238,7 @@ async def get_current_price():
 
 
 async def get_current_price_with_recovery(valid_until=None):
-    if not await ensure_metaapi_connection(valid_until):
+    if not await ensure_execution_api_connection(valid_until):
         return None
     try:
         return await get_current_price()
@@ -1246,7 +1246,7 @@ async def get_current_price_with_recovery(valid_until=None):
         raise
     except Exception as error:
         print(f"⚠️ Local MT5 quote failed: {error}")
-        await set_metaapi_connection_state("LOST", str(error))
+        await set_execution_api_connection_state("LOST", str(error))
         return None
 
 
@@ -1756,7 +1756,7 @@ def build_trade_identifiers(signal_id, position_number):
 
 
 async def find_existing_signal_position(signal_id, position_number, client_id):
-    if not await ensure_metaapi_connection():
+    if not await ensure_execution_api_connection():
         return None
     _, marker = build_trade_identifiers(signal_id, position_number)
     for p in await get_api_positions():
@@ -1807,14 +1807,14 @@ async def execute_signal(
     signal,
     execution_price
 ):
-    """Serialize the complete order sequence against the MetaApi monitor."""
+    """Serialize the complete order sequence against the execution API monitor."""
 
-    global metaapi_operation_lock
+    global execution_api_operation_lock
 
-    if metaapi_operation_lock is None:
-        metaapi_operation_lock = asyncio.Lock()
+    if execution_api_operation_lock is None:
+        execution_api_operation_lock = asyncio.Lock()
 
-    async with metaapi_operation_lock:
+    async with execution_api_operation_lock:
         return await _execute_signal_locked(
             signal,
             execution_price
@@ -1844,7 +1844,7 @@ async def _execute_signal_locked(signal, execution_price):
         except Exception as error:
             print(f"⚠️ Existing-position reconciliation failed: {error}")
             return False, positions
-        if not await ensure_metaapi_connection(signal.get("valid_until")):
+        if not await ensure_execution_api_connection(signal.get("valid_until")):
             return False, positions
         try:
             result = await asyncio.wait_for(api_request("POST", "/demo/order", payload={
@@ -1873,15 +1873,28 @@ async def _execute_signal_locked(signal, execution_price):
             await send_notification("❌ LOCAL MT5 API REJECTED ORDER\n\n"
                 f"Signal ID: {signal['signal_id']}\nPosition: {n}/{POSITIONS_PER_SIGNAL}\nResult: {result!r}")
             return False, positions
-        await asyncio.sleep(0.5)
-        found = await find_existing_signal_position(signal["signal_id"], n, client_id)
+        # The API has confirmed acceptance. Reconcile visibility, but never resubmit
+        # this request automatically: a delayed MT5 position can still appear later.
         pid = result.get("position_id") or result.get("position_ticket")
+        try:
+            await asyncio.sleep(0.5)
+            found = await find_existing_signal_position(signal["signal_id"], n, client_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as reconcile_error:
+            found = None
+            print(f"⚠️ Post-acceptance position reconciliation failed: {reconcile_error}")
+
         if found is None:
-            await send_notification("⚠️ ORDER ACCEPTED BUT POSITION NOT VISIBLE\n\n"
-                f"Signal ID: {signal['signal_id']}\nRequest ID: {marker}\nNo duplicate retry will be attempted.")
+            await send_notification("⚠️ ORDER ACCEPTED; POSITION RECONCILIATION PENDING\n\n"
+                f"Signal ID: {signal['signal_id']}\nRequest ID: {marker}\n"
+                f"API-reported position ID: {pid or 'not supplied'}\n"
+                "No duplicate retry will be attempted. Check MT5/API history before any manual retry.")
             if not pid:
+                # Do not claim successful execution without a visible position or its identifier.
                 return False, positions
-            found = {"id": str(pid), "positionId": str(pid), "position_id": pid, "comment": marker, "symbol": SYMBOL}
+            found = {"id": str(pid), "positionId": str(pid), "position_id": pid,
+                     "comment": marker, "symbol": SYMBOL}
         pid = found.get("position_id") or found.get("identifier") or pid or found.get("ticket") or found.get("id")
         rec = build_position_record(n, tp_number, tp, found, str(result.get("retcode", "TRADE_RETCODE_DONE")))
         rec["position_id"] = pid
@@ -2032,7 +2045,7 @@ async def wait_for_entry(
                     f"Execution price: {execution_price:.3f}\n"
                     f"SL: {signal['stoploss']}\n"
                     f"Execution TPs: {signal['execution_tps']}\n"
-                    f"MetaApi state: {metaapi_connection_state}"
+                    f"Execution API state: {execution_api_connection_state}"
                 )
 
                 success, positions = await execute_signal(
@@ -2179,7 +2192,7 @@ async def wait_for_entry(
                         f"Extended range: {extended_low:.3f} - {extended_high:.3f}\n"
                         f"Inside original: {'YES' if inside_original else 'NO'}\n"
                         f"Inside extended: {'YES' if inside_extended else 'NO'}\n"
-                        f"MetaApi state: {metaapi_connection_state}\n"
+                        f"Execution API state: {execution_api_connection_state}\n"
                         f"Valid until: {format_cat_time(signal['valid_until'])}\n"
                         "Decision: WAIT — no order has been sent."
                     )
@@ -3458,7 +3471,7 @@ def display_settings():
     )
 
     print(
-        "  • MetaApi auto-reconnect: ON"
+        "  • Execution API auto-reconnect: ON"
     )
 
     print(
@@ -3506,7 +3519,7 @@ async def status_heartbeat():
             await send_notification(
                 "💓 PHASE 6 HEARTBEAT\n\n"
                 f"Time: {format_cat_time(now_iso())}\n"
-                f"MetaApi: {metaapi_connection_state}\n"
+                f"Execution API: {execution_api_connection_state}\n"
                 f"Symbol: {SYMBOL}\n"
                 f"Active watchers: {active_watchers}\n"
                 f"Pending signals: {len(pending_signals)}\n"
@@ -3539,9 +3552,9 @@ async def main():
     global api_session
     global account
     global telegram_client
-    global metaapi_connection_lock
-    global metaapi_operation_lock
-    global metaapi_connection_state
+    global execution_api_connection_lock
+    global execution_api_operation_lock
+    global execution_api_connection_state
 
     print()
     print(
@@ -3657,9 +3670,9 @@ async def main():
     if not account.get("trade_allowed"):
         raise RuntimeError("SAFETY STOP: MT5 account trading is disabled.")
     print(f"✅ Demo account confirmed: {account.get('company')} / {account.get('server')}")
-    metaapi_connection_lock = asyncio.Lock()
-    metaapi_operation_lock = asyncio.Lock()
-    await set_metaapi_connection_state("CONNECTED")
+    execution_api_connection_lock = asyncio.Lock()
+    execution_api_operation_lock = asyncio.Lock()
+    await set_execution_api_connection_state("CONNECTED")
     await verify_symbol()
 
 
@@ -3863,7 +3876,7 @@ async def main():
                 f"{event.raw_text or '[EMPTY]'}"
             )
 
-            # Run processing separately so MetaApi operations and
+            # Run processing separately so execution API operations and
             # notifications never block Telegram's update loop.
             asyncio.create_task(
                 handle_message(
@@ -3897,8 +3910,8 @@ async def main():
         daily_report_scheduler()
     )
 
-    metaapi_monitor_task = asyncio.create_task(
-        metaapi_connection_monitor()
+    execution_api_monitor_task = asyncio.create_task(
+        execution_api_connection_monitor()
     )
 
     status_heartbeat_task = asyncio.create_task(
@@ -3944,7 +3957,7 @@ async def main():
     await send_notification(
         "🟢 PHASE 6 DEMO EXECUTOR ONLINE\n\n"
         f"Time: {format_cat_time(now_iso())}\n"
-        f"MetaApi connection: {metaapi_connection_state}\n"
+        f"Execution API connection: {execution_api_connection_state}\n"
         f"MT5 symbol: {SYMBOL}\n"
         f"Lot size: {LOT_SIZE} x {POSITIONS_PER_SIGNAL} positions\n"
         f"Phase 4 INPUT channel: {PHASE4_OUTPUT_CHANNEL_ID}\n"
@@ -3968,7 +3981,7 @@ async def main():
 
         daily_report_task.cancel()
 
-        metaapi_monitor_task.cancel()
+        execution_api_monitor_task.cancel()
 
         status_heartbeat_task.cancel()
 
