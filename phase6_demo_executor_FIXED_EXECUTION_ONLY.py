@@ -3805,41 +3805,64 @@ async def main():
     # already proven to receive Phase 4 messages.
     # --------------------------------------------------------
 
-    async def dispatch_phase4_event(event, event_kind):
+    async def dispatch_telegram_event(event, event_kind):
         try:
             event_chat_id = int(event.chat_id or 0)
+            message_text = event.raw_text or ""
+            chat_title = "UNKNOWN"
+            try:
+                chat = await event.get_chat()
+                chat_title = (
+                    getattr(chat, "title", None)
+                    or getattr(chat, "username", None)
+                    or getattr(chat, "first_name", None)
+                    or str(event_chat_id)
+                )
+            except Exception as chat_error:
+                chat_title = f"unresolved ({chat_error})"
+
+            # TEMPORARY DIAGNOSTIC MODE: log every new/edited Telegram message
+            # visible to this account, so we can discover the actual Phase 4
+            # chat ID and whether Phase 4 is publishing or editing messages.
+            print()
+            print("=" * 90)
+            print(f"📨 TELEGRAM {event_kind} — DIAGNOSTIC")
+            print(f"Chat title: {chat_title}")
+            print(f"Chat ID: {event_chat_id}")
+            print(f"Configured Phase 4 ID: {PHASE4_OUTPUT_CHANNEL_ID}")
+            print(f"Chat ID matches Phase 4: {event_chat_id == PHASE4_OUTPUT_CHANNEL_ID}")
+            print(f"Message ID: {getattr(event.message, 'id', 'UNKNOWN')}")
+            print(f"Date: {getattr(event.message, 'date', 'UNKNOWN')}")
+            print(f"Text length: {len(message_text)}")
+            print("FULL MESSAGE TEXT BEGIN")
+            print(message_text if message_text else "[EMPTY / MEDIA-ONLY MESSAGE]")
+            print("FULL MESSAGE TEXT END")
+            print("=" * 90)
+
             if event_chat_id != PHASE4_OUTPUT_CHANNEL_ID:
                 return
 
-            message_text = event.raw_text or ""
-            print()
-            print(f"📥 PHASE 4 {event_kind} RECEIVED")
-            print("=" * 70)
-            print(f"Chat ID:    {event_chat_id}")
-            print(f"Message ID: {event.message.id}")
-            print(f"Event type: {event_kind}")
-            print("Text:")
-            print(message_text or "[EMPTY]")
-
-            # Process only new messages here. Edited messages are logged so
-            # we can diagnose Phase 4 edits without accidentally executing
-            # the same signal twice.
+            print("✅ MESSAGE IS FROM CONFIGURED PHASE 4 CHAT")
             if event_kind == "NEW MESSAGE":
                 asyncio.create_task(handle_message(event))
+            else:
+                print("ℹ️ Edited message logged only; it will not trigger execution.")
         except Exception as error:
             print()
             print("❌ TELEGRAM EVENT DISPATCH ERROR:")
-            print(error)
+            print(repr(error))
             import traceback
             traceback.print_exc()
 
-    @client.on(events.NewMessage(chats=phase4_output_entity))
+    # Deliberately global during diagnosis. Logs all chats visible to this
+    # Telegram account; only the configured Phase 4 chat is passed to handler.
+    @client.on(events.NewMessage())
     async def on_new_message(event):
-        await dispatch_phase4_event(event, "NEW MESSAGE")
+        await dispatch_telegram_event(event, "NEW MESSAGE")
 
-    @client.on(events.MessageEdited(chats=phase4_output_entity))
+    @client.on(events.MessageEdited())
     async def on_edited_message(event):
-        await dispatch_phase4_event(event, "MESSAGE EDITED")
+        await dispatch_telegram_event(event, "MESSAGE EDITED")
 
     print(f"✅ Telegram handlers registered for resolved Phase 4 entity: {PHASE4_OUTPUT_CHANNEL_ID}")
     try:
