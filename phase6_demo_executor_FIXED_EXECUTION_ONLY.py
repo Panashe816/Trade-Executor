@@ -62,7 +62,7 @@ TELEGRAM_SESSION_STRING = os.getenv(
 # PHASE 4 PRIVATE OUTPUT CHANNEL
 # ============================================================
 
-PHASE4_OUTPUT_CHANNEL_ID = -1003995895185
+PHASE4_OUTPUT_CHANNEL_ID = int(os.getenv("PHASE4_OUTPUT_CHANNEL_ID", "-1003995895185"))
 
 
 # ============================================================
@@ -85,7 +85,7 @@ TELEGRAM_BOT_TOKEN = os.getenv(
 
 PHASE6_STATUS_CHAT_ID = os.getenv(
     "PHASE6_STATUS_CHAT_ID",
-    ""
+    "-1004424659050"
 )
 
 TELEGRAM_NOTIFICATION_CHAT_ID = os.getenv(
@@ -1868,11 +1868,25 @@ async def _execute_signal_locked(signal, execution_price):
                     continue
             except Exception as verify_error:
                 print(f"⚠️ Reconciliation check failed: {verify_error}")
-            return False, positions
+            return False, positions, False
         if not result.get("execution_accepted"):
+            broker_result = result.get("result") if isinstance(result.get("result"), dict) else result
+            retcode = broker_result.get("retcode")
+            comment = str(broker_result.get("comment", "")).strip().lower()
+            market_closed = (retcode == 10018) or ("market closed" in comment)
+            if market_closed:
+                print(f"🛑 MARKET CLOSED — discarding signal {signal['signal_id']}; no retry will be attempted.")
+                await send_notification(
+                    "🛑 SIGNAL DISCARDED — MARKET CLOSED\n\n"
+                    f"Signal ID: {signal['signal_id']}\n"
+                    f"Position: {n}/{POSITIONS_PER_SIGNAL}\n"
+                    "The broker rejected the order because the market is closed. "
+                    "This signal will not be retried."
+                )
+                return False, positions, True
             await send_notification("❌ LOCAL MT5 API REJECTED ORDER\n\n"
                 f"Signal ID: {signal['signal_id']}\nPosition: {n}/{POSITIONS_PER_SIGNAL}\nResult: {result!r}")
-            return False, positions
+            return False, positions, False
         # The API has confirmed acceptance. Reconcile visibility, but never resubmit
         # this request automatically: a delayed MT5 position can still appear later.
         pid = result.get("position_id") or result.get("position_ticket")
@@ -1904,7 +1918,7 @@ async def _execute_signal_locked(signal, execution_price):
         await send_notification("✅ POSITION EXECUTED THROUGH LOCAL MT5 API\n\n"
             f"Signal ID: {signal['signal_id']}\nPosition: {n}/{POSITIONS_PER_SIGNAL}\nTP{tp_number}: {tp}\n"
             f"Position ID: {pid or 'Unknown'}\nVolume: 0.01 lot\nMode: DEMO ONLY")
-    return len(positions) == POSITIONS_PER_SIGNAL, positions
+    return len(positions) == POSITIONS_PER_SIGNAL, positions, False
 
 
 
@@ -1960,6 +1974,20 @@ def mark_signal_executed(
 # ============================================================
 # CHECK PRICE AND EXECUTE WHEN RANGE IS REACHED
 # ============================================================
+
+def discard_closed_market_signal(signal, reason="Broker reported market closed"):
+    """Persist a terminal rejected state and remove the signal from retry queues."""
+    signal_id = signal["signal_id"]
+    signal["status"] = "REJECTED_MARKET_CLOSED"
+    signal["rejected_at"] = now_iso()
+    signal["rejection_reason"] = reason
+    signal["execution_triggered"] = False
+    lifecycle_signals[signal_id] = signal
+    pending_signals.pop(signal_id, None)
+    save_lifecycle()
+    save_pending_signals()
+    print(f"🛑 Signal discarded after market-closed rejection: {signal_id}")
+
 
 async def wait_for_entry(
     signal
@@ -2048,10 +2076,14 @@ async def wait_for_entry(
                     f"Execution API state: {execution_api_connection_state}"
                 )
 
-                success, positions = await execute_signal(
+                success, positions, market_closed = await execute_signal(
                     signal,
                     execution_price
                 )
+
+                if market_closed:
+                    discard_closed_market_signal(signal)
+                    return
 
                 if success:
                     signal["positions"] = positions
@@ -2171,31 +2203,8 @@ async def wait_for_entry(
                 print(f"   Required range: {extended_low:.3f} - {extended_high:.3f}")
                 print("   Decision: WAIT — no trade will be sent yet.")
 
-                last_report = signal_status_report_times.get(signal_id)
-                now_timestamp = now_utc().timestamp()
-
-                if (
-                    last_report is None
-                    or now_timestamp - last_report >= SIGNAL_STATUS_REPORT_SECONDS
-                ):
-                    signal_status_report_times[signal_id] = now_timestamp
-
-                    await send_notification(
-                        "🔄 ENTRY WATCHER HEARTBEAT\n\n"
-                        f"Signal ID: {signal_id}\n"
-                        f"Time: {format_cat_time(now_iso())}\n"
-                        f"Direction: {signal['direction']}\n"
-                        f"Bid: {bid:.3f}\n"
-                        f"Ask: {ask:.3f}\n"
-                        f"Execution price: {execution_price:.3f}\n"
-                        f"Original range: {signal['entry_low']:.3f} - {signal['entry_high']:.3f}\n"
-                        f"Extended range: {extended_low:.3f} - {extended_high:.3f}\n"
-                        f"Inside original: {'YES' if inside_original else 'NO'}\n"
-                        f"Inside extended: {'YES' if inside_extended else 'NO'}\n"
-                        f"Execution API state: {execution_api_connection_state}\n"
-                        f"Valid until: {format_cat_time(signal['valid_until'])}\n"
-                        "Decision: WAIT — no order has been sent."
-                    )
+                # Routine per-signal watcher heartbeat notifications disabled.
+                # Waiting is logged locally; meaningful errors still send alerts.
 
                 if not signal.get("waiting_notification_sent", False):
                     await notify_signal_waiting(
@@ -3914,9 +3923,7 @@ async def main():
         execution_api_connection_monitor()
     )
 
-    status_heartbeat_task = asyncio.create_task(
-        status_heartbeat()
-    )
+    # Routine one-minute status heartbeat disabled to avoid Telegram message flooding.
 
     # --------------------------------------------------------
     # RESUME PENDING / OPEN POSITIONS
@@ -3983,7 +3990,6 @@ async def main():
 
         execution_api_monitor_task.cancel()
 
-        status_heartbeat_task.cancel()
 
         for task in list(
             watch_tasks.values()
