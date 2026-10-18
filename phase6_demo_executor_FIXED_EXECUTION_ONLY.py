@@ -3805,73 +3805,52 @@ async def main():
     # already proven to receive Phase 4 messages.
     # --------------------------------------------------------
 
-    @client.on(
-        events.NewMessage()
-    )
-    async def on_new_message(event):
-
+    async def dispatch_phase4_event(event, event_kind):
         try:
-
-            event_chat_id = int(
-                event.chat_id
-            )
-
-            if event_chat_id != (
-                PHASE4_OUTPUT_CHANNEL_ID
-            ):
-
+            event_chat_id = int(event.chat_id or 0)
+            if event_chat_id != PHASE4_OUTPUT_CHANNEL_ID:
                 return
 
+            message_text = event.raw_text or ""
             print()
-            print(
-                "📥 PHASE 4 CHANNEL MESSAGE RECEIVED"
-            )
-            print(
-                "=" * 70
-            )
-            print(
-                f"Chat ID:    {event_chat_id}"
-            )
-            print(
-                f"Message ID: {event.message.id}"
-            )
-            print(
-                "Text:"
-            )
-            print(
-                event.raw_text or ""
-            )
+            print(f"📥 PHASE 4 {event_kind} RECEIVED")
+            print("=" * 70)
+            print(f"Chat ID:    {event_chat_id}")
+            print(f"Message ID: {event.message.id}")
+            print(f"Event type: {event_kind}")
+            print("Text:")
+            print(message_text or "[EMPTY]")
 
-            await send_notification(
-                "📥 PHASE 4 MESSAGE RECEIVED\n\n"
-                f"Time: {format_cat_time(now_iso())}\n"
-                f"Message ID: {event.message.id}\n"
-                f"Chat ID: {event_chat_id}\n\n"
-                "Raw message:\n"
-                f"{event.raw_text or '[EMPTY]'}"
-            )
-
-            # Run processing separately so execution API operations and
-            # notifications never block Telegram's update loop.
-            asyncio.create_task(
-                handle_message(
-                    event
-                )
-            )
-
+            # Process only new messages here. Edited messages are logged so
+            # we can diagnose Phase 4 edits without accidentally executing
+            # the same signal twice.
+            if event_kind == "NEW MESSAGE":
+                asyncio.create_task(handle_message(event))
         except Exception as error:
-
             print()
-            print(
-                "❌ TELEGRAM EVENT DISPATCH ERROR:"
-            )
-            print(
-                error
-            )
-
+            print("❌ TELEGRAM EVENT DISPATCH ERROR:")
+            print(error)
             import traceback
-
             traceback.print_exc()
+
+    @client.on(events.NewMessage(chats=phase4_output_entity))
+    async def on_new_message(event):
+        await dispatch_phase4_event(event, "NEW MESSAGE")
+
+    @client.on(events.MessageEdited(chats=phase4_output_entity))
+    async def on_edited_message(event):
+        await dispatch_phase4_event(event, "MESSAGE EDITED")
+
+    print(f"✅ Telegram handlers registered for resolved Phase 4 entity: {PHASE4_OUTPUT_CHANNEL_ID}")
+    try:
+        latest_messages = await client.get_messages(phase4_output_entity, limit=1)
+        if latest_messages:
+            latest = latest_messages[0]
+            print(f"ℹ️ Latest Phase 4 channel message at startup: id={latest.id}, date={latest.date}, text={(latest.raw_text or '')[:160]!r}")
+        else:
+            print("⚠️ Phase 4 channel returned no recent messages at startup.")
+    except Exception as error:
+        print(f"⚠️ Could not inspect latest Phase 4 message: {error}")
 
     # --------------------------------------------------------
     # BACKGROUND LIFECYCLE TASKS
