@@ -3864,6 +3864,29 @@ async def main():
     async def on_edited_message(event):
         await dispatch_telegram_event(event, "MESSAGE EDITED")
 
+    # Raw MTProto diagnostics: message updates that may not reach the
+    # NewMessage/MessageEdited event builders are logged for investigation.
+    @client.on(events.Raw)
+    async def on_raw_telegram_update(update):
+        try:
+            update_name = type(update).__name__
+            if update_name in {
+                "UpdateNewMessage",
+                "UpdateNewChannelMessage",
+                "UpdateEditMessage",
+                "UpdateEditChannelMessage",
+                "UpdateShortMessage",
+                "UpdateShortChatMessage",
+                "UpdateShort",
+            }:
+                print()
+                print("-" * 90)
+                print(f"📡 TELEGRAM RAW UPDATE: {update_name}")
+                print(repr(update))
+                print("-" * 90)
+        except Exception as raw_error:
+            print(f"❌ RAW TELEGRAM UPDATE LOGGER ERROR: {raw_error!r}")
+
     print(f"✅ Telegram handlers registered for resolved Phase 4 entity: {PHASE4_OUTPUT_CHANNEL_ID}")
     try:
         latest_messages = await client.get_messages(phase4_output_entity, limit=1)
