@@ -763,7 +763,7 @@ def extract_label_value(
 ):
 
     pattern = (
-        rf"(?im)^[^\\r\\n]*?\\b{re.escape(label)}\\s*:\\s*(.+?)\\s*$"
+        rf"(?im)^[^\r\n]*?\b{re.escape(label)}\s*:\s*(.+?)\s*$"
     )
 
     match = re.search(
@@ -3076,11 +3076,14 @@ async def handle_message(
 
             return
 
-        # Phase 4 input is read-only. If the status chat is accidentally
-        # configured to the same Telegram chat, ignore Phase 6 heartbeat and
-        # diagnostic messages instead of feeding them back into Phase 6.
-        if "SIGNAL PARSED" not in message_text.upper():
-            return
+        # Do not require one exact heading: Phase 4 formatting can vary.
+        # Attempt to parse each non-empty message from the configured output
+        # channel; the structured-field parser below rejects non-signal posts.
+        print()
+        print("📥 PHASE 6 RECEIVED PHASE 4 CHANNEL MESSAGE")
+        print(f"   Chat ID: {chat_id}")
+        print(f"   Message ID: {event.message.id}")
+        print(f"   Contains 'SIGNAL PARSED' heading: {'SIGNAL PARSED' in message_text.upper()}")
 
         message_id = int(
             event.message.id
