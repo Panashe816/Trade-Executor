@@ -206,7 +206,7 @@ telegram_client = None
 
 signal_status_report_times = {}
 STATUS_HEARTBEAT_SECONDS = 60
-SIGNAL_STATUS_REPORT_SECONDS = 30
+# Periodic per-signal status messages are disabled to avoid notification flooding.
 
 # Execution API connection state tracking
 execution_api_connection_state = "UNKNOWN"
@@ -1366,6 +1366,9 @@ async def send_notification(
                 "⚠️ Phase 6 private Telegram notification failed: "
                 f"{type(error).__name__}: {error}"
             )
+            # Don't fan out to a fallback bot after a failed MTProto send.
+            # This prevents duplicate alerts during Telegram rate limiting.
+            return False
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_NOTIFICATION_CHAT_ID:
         return False
@@ -1843,9 +1846,9 @@ async def _execute_signal_locked(signal, execution_price):
                 continue
         except Exception as error:
             print(f"⚠️ Existing-position reconciliation failed: {error}")
-            return False, positions
+            return False, positions, False
         if not await ensure_execution_api_connection(signal.get("valid_until")):
-            return False, positions
+            return False, positions, False
         try:
             result = await asyncio.wait_for(api_request("POST", "/demo/order", payload={
                 "request_id": marker, "side": direction,
@@ -1906,7 +1909,7 @@ async def _execute_signal_locked(signal, execution_price):
                 "No duplicate retry will be attempted. Check MT5/API history before any manual retry.")
             if not pid:
                 # Do not claim successful execution without a visible position or its identifier.
-                return False, positions
+                return False, positions, False
             found = {"id": str(pid), "positionId": str(pid), "position_id": pid,
                      "comment": marker, "symbol": SYMBOL}
         pid = found.get("position_id") or found.get("identifier") or pid or found.get("ticket") or found.get("id")
@@ -3509,47 +3512,7 @@ def display_settings():
     )
 
 
-# ============================================================
-# PRIVATE TELEGRAM STATUS HEARTBEAT
-# ============================================================
-
-async def status_heartbeat():
-
-    while True:
-
-        try:
-
-            active_watchers = sum(
-                1
-                for task in watch_tasks.values()
-                if task is not None and not task.done()
-            )
-
-            await send_notification(
-                "💓 PHASE 6 HEARTBEAT\n\n"
-                f"Time: {format_cat_time(now_iso())}\n"
-                f"Execution API: {execution_api_connection_state}\n"
-                f"Symbol: {SYMBOL}\n"
-                f"Active watchers: {active_watchers}\n"
-                f"Pending signals: {len(pending_signals)}\n"
-                f"Executed signals in memory: {len(executed_signals)}\n"
-                "Telegram listener: ACTIVE\n"
-                "Worker: ALIVE"
-            )
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as error:
-
-            print(
-                "⚠️ Status heartbeat failed: "
-                f"{type(error).__name__}: {error}"
-            )
-
-        await asyncio.sleep(
-            STATUS_HEARTBEAT_SECONDS
-        )
+# Routine status heartbeats removed; notifications are event-driven.
 
 
 # ============================================================
