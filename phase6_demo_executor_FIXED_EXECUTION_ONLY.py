@@ -1020,9 +1020,9 @@ def read_phase4_execution_message(message, chat_id, message_id):
 
     text = str(message or "")
 
-    if "SIGNAL PARSED" not in text.upper():
-        return None
-
+    # Do not require the literal "SIGNAL PARSED" heading. Validate the
+    # structured execution fields below instead; incomplete messages are rejected.
+    
     def label(label_name):
         match = re.search(
             rf"(?im)^.*?{re.escape(label_name)}\s*:\s*(.+?)\s*$",
