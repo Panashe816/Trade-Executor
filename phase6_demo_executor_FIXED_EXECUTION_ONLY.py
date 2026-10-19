@@ -3866,6 +3866,7 @@ async def main():
             # Keep unrelated channel traffic to a compact metadata line. Only
             # print full message text for the configured Phase 4 output channel.
             if event_chat_id != PHASE4_OUTPUT_CHANNEL_ID:
+                event_lag_text = f"{event_lag:.3f}" if event_lag is not None else "UNKNOWN"
                 print(
                     f"📨 TELEGRAM {event_kind} OTHER_CHAT "
                     f"chat={chat_title!r} chat_id={event_chat_id} "
@@ -3873,7 +3874,7 @@ async def main():
                     f"message_date_utc={message_date_utc.isoformat() if message_date_utc else 'UNKNOWN'} "
                     f"edit_date_utc={edit_date_utc.isoformat() if edit_date_utc else 'NONE'} "
                     f"callback_utc={received_utc.isoformat()} "
-                    f"event_lag_seconds={event_lag:.3f if event_lag is not None else 'UNKNOWN'}"
+                    f"event_lag_seconds={event_lag_text}"
                 )
                 return
 
