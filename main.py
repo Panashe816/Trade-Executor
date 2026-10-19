@@ -11,15 +11,16 @@ from contextlib import asynccontextmanager
 
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
 API_KEY = os.getenv("API_KEY")
-ENABLE_DEMO_TRADING = (
-    os.getenv("ENABLE_DEMO_TRADING", "false").lower() == "true"
-)
+ENABLE_DEMO_TRADING = os.getenv("ENABLE_DEMO_TRADING", "false").lower() == "true"
+ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+LIVE_ACCOUNT_LOGIN = os.getenv("LIVE_ACCOUNT_LOGIN", "").strip()
+LIVE_ACCOUNT_SERVER = os.getenv("LIVE_ACCOUNT_SERVER", "").strip()
 TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 DEFAULT_SYMBOL = "XAUUSD_i"
 MAGIC = 816202610
@@ -42,7 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Gold Robot Execution API",
     version="0.3.0",
-    description="Local MT5 API with explicitly gated demo order testing.",
+    description="MT5 API with separately gated demo and live execution.",
     lifespan=lifespan,
 )
 
@@ -175,6 +176,24 @@ def require_demo_trading():
     return account
 
 
+def require_live_trading():
+    if not ENABLE_LIVE_TRADING:
+        raise HTTPException(status_code=403, detail="Live execution is disabled. Enable it explicitly in .env.")
+    if not LIVE_ACCOUNT_LOGIN or not LIVE_ACCOUNT_SERVER:
+        raise HTTPException(status_code=503, detail="Live account allowlist is not configured.")
+    account = require_account()
+    if account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO:
+        raise HTTPException(status_code=403, detail="Refusing live execution: MT5 account is a demo account.")
+    if str(account.login) != LIVE_ACCOUNT_LOGIN or account.server != LIVE_ACCOUNT_SERVER:
+        raise HTTPException(status_code=403, detail="Refusing live execution: MT5 account login/server does not match the configured allowlist.")
+    if not account.trade_allowed:
+        raise HTTPException(status_code=403, detail="Trading is disabled for this account")
+    terminal = mt5.terminal_info()
+    if terminal is None or not terminal.trade_allowed:
+        raise HTTPException(status_code=403, detail="MT5 terminal trading is disabled")
+    return account
+
+
 class DemoOrderRequest(BaseModel):
     request_id: str = Field(min_length=8, max_length=100)
     side: str
@@ -191,8 +210,9 @@ def health():
         "api": "ok",
         "mt5_connected": bool(terminal and terminal.connected),
         "account_authenticated": account is not None,
-        "trading_enabled_by_api": ENABLE_DEMO_TRADING,
-        "demo_account_only": True,
+        "trading_enabled_by_api": ENABLE_DEMO_TRADING or ENABLE_LIVE_TRADING,
+        "demo_account_only": not ENABLE_LIVE_TRADING,
+        "live_trading_enabled": ENABLE_LIVE_TRADING,
     }
 
 
@@ -294,7 +314,9 @@ def get_pending_orders():
 
 
 @app.post("/demo/order", dependencies=[Depends(authorize)])
-def place_demo_order(request: DemoOrderRequest):
+@app.post("/live/order", dependencies=[Depends(authorize)])
+def place_order(request: DemoOrderRequest, http_request: Request):
+    live_mode = http_request.url.path == "/live/order"
     side = request.side.strip().upper()
 
     if side not in ("BUY", "SELL"):
@@ -329,7 +351,7 @@ def place_demo_order(request: DemoOrderRequest):
                     "position_ticket": reconciled.get("ticket"),
                     "position_id": reconciled.get("position_id"),
                     "account_login": getattr(mt5.account_info(), "login", None),
-                    "demo_account": True,
+                    "demo_account": not live_mode,
                     "execution_accepted": True,
                     "reconciled": True,
                     "reconciliation_source": reconciled.get("source"),
@@ -346,7 +368,7 @@ def place_demo_order(request: DemoOrderRequest):
                 },
             )
 
-        account = require_demo_trading()
+        account = require_live_trading() if live_mode else require_demo_trading()
 
         info = mt5.symbol_info(DEFAULT_SYMBOL)
         if info is None:
@@ -461,7 +483,7 @@ def place_demo_order(request: DemoOrderRequest):
             "deal_ticket": result.deal,
             "account_login": account.login,
             "server": account.server,
-            "demo_account": True,
+            "demo_account": not live_mode,
             "execution_accepted": result.retcode in (
                 mt5.TRADE_RETCODE_DONE,
                 mt5.TRADE_RETCODE_DONE_PARTIAL,
@@ -556,8 +578,9 @@ def get_position_history(position_id: int, days: int = 90):
 def root():
     return {
         "service": "Gold Robot Execution API",
-        "mode": "local demo diagnostics",
+        "mode": "live enabled" if ENABLE_LIVE_TRADING else "demo-only" if ENABLE_DEMO_TRADING else "read-only",
         "docs": "/docs",
-        "order_execution_enabled": ENABLE_DEMO_TRADING,
-        "demo_account_only": True,
+        "order_execution_enabled": ENABLE_DEMO_TRADING or ENABLE_LIVE_TRADING,
+        "demo_account_only": not ENABLE_LIVE_TRADING,
+        "live_trading_enabled": ENABLE_LIVE_TRADING,
     }
