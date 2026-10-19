@@ -3839,38 +3839,61 @@ async def main():
             except Exception as chat_error:
                 chat_title = f"unresolved ({chat_error})"
 
-            # TEMPORARY DIAGNOSTIC MODE: log every new/edited Telegram message
-            # visible to this account, so we can discover the actual Phase 4
-            # chat ID and whether Phase 4 is publishing or editing messages.
-            print()
-            print("=" * 90)
-            print(f"📨 TELEGRAM {event_kind} — DIAGNOSTIC")
             received_utc = now_utc()
             message_date = getattr(event.message, "date", None)
-            if message_date is not None:
-                if message_date.tzinfo is None:
-                    message_date = message_date.replace(tzinfo=timezone.utc)
-                delivery_lag = (received_utc - message_date.astimezone(timezone.utc)).total_seconds()
-                print(f"Event callback received UTC: {received_utc.isoformat()}")
-                print(f"Telegram message date UTC: {message_date.astimezone(timezone.utc).isoformat()}")
-                print(f"Message-to-callback lag seconds: {delivery_lag:.3f}")
-            else:
-                print(f"Event callback received UTC: {received_utc.isoformat()}")
-                print("Message-to-callback lag seconds: unavailable (no Telegram date)")
+            edit_date = getattr(event.message, "edit_date", None)
+
+            # For edits, measure from Telegram's edit timestamp when available.
+            # Original message date is retained separately to avoid falsely
+            # reporting the age of an old post as edit-delivery latency.
+            effective_event_date = edit_date if event_kind == "MESSAGE EDITED" and edit_date else message_date
+
+            def as_utc(value):
+                if value is None:
+                    return None
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                return value.astimezone(timezone.utc)
+
+            message_date_utc = as_utc(message_date)
+            edit_date_utc = as_utc(edit_date)
+            effective_event_date_utc = as_utc(effective_event_date)
+            event_lag = (
+                (received_utc - effective_event_date_utc).total_seconds()
+                if effective_event_date_utc is not None else None
+            )
+
+            # Keep unrelated channel traffic to a compact metadata line. Only
+            # print full message text for the configured Phase 4 output channel.
+            if event_chat_id != PHASE4_OUTPUT_CHANNEL_ID:
+                print(
+                    f"📨 TELEGRAM {event_kind} OTHER_CHAT "
+                    f"chat={chat_title!r} chat_id={event_chat_id} "
+                    f"message_id={getattr(event.message, 'id', 'UNKNOWN')} "
+                    f"message_date_utc={message_date_utc.isoformat() if message_date_utc else 'UNKNOWN'} "
+                    f"edit_date_utc={edit_date_utc.isoformat() if edit_date_utc else 'NONE'} "
+                    f"callback_utc={received_utc.isoformat()} "
+                    f"event_lag_seconds={event_lag:.3f if event_lag is not None else 'UNKNOWN'}"
+                )
+                return
+
+            print()
+            print("=" * 90)
+            print(f"📨 TELEGRAM {event_kind} — PHASE 4 DIAGNOSTIC")
+            print(f"Callback received UTC: {received_utc.isoformat()}")
+            print(f"Original message date UTC: {message_date_utc.isoformat() if message_date_utc else 'UNKNOWN'}")
+            print(f"Edit date UTC: {edit_date_utc.isoformat() if edit_date_utc else 'NONE'}")
+            print(f"Event-to-callback lag seconds: {event_lag:.3f}" if event_lag is not None else "Event-to-callback lag seconds: unavailable")
             print(f"Chat title: {chat_title}")
             print(f"Chat ID: {event_chat_id}")
             print(f"Configured Phase 4 ID: {PHASE4_OUTPUT_CHANNEL_ID}")
-            print(f"Chat ID matches Phase 4: {event_chat_id == PHASE4_OUTPUT_CHANNEL_ID}")
             print(f"Message ID: {getattr(event.message, 'id', 'UNKNOWN')}")
-            print(f"Date: {getattr(event.message, 'date', 'UNKNOWN')}")
+            print(f"Event kind: {event_kind}")
             print(f"Text length: {len(message_text)}")
             print("FULL MESSAGE TEXT BEGIN")
             print(message_text if message_text else "[EMPTY / MEDIA-ONLY MESSAGE]")
             print("FULL MESSAGE TEXT END")
             print("=" * 90)
-
-            if event_chat_id != PHASE4_OUTPUT_CHANNEL_ID:
-                return
 
             print("✅ MESSAGE IS FROM CONFIGURED PHASE 4 CHAT")
             # Process both new messages and edits. Phase 4 may publish a
