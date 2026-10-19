@@ -1347,6 +1347,9 @@ async def send_notification(
     message
 ):
 
+    notification_started = now_utc()
+    print(f"📤 TELEGRAM_SEND_START utc={notification_started.isoformat()} chars={len(str(message))}")
+
     # Phase 4 is READ-ONLY input for Phase 6.
     # Diagnostics/trade notifications go to the separate private
     # Phase 6 status channel.
@@ -1360,11 +1363,13 @@ async def send_notification(
                 int(target_chat),
                 message
             )
+            print(f"📤 TELEGRAM_SEND_OK elapsed_seconds={(now_utc() - notification_started).total_seconds():.3f}")
             return True
         except Exception as error:
             print(
                 "⚠️ Phase 6 private Telegram notification failed: "
-                f"{type(error).__name__}: {error}"
+                f"{type(error).__name__}: {error}; "
+                f"elapsed_seconds={(now_utc() - notification_started).total_seconds():.3f}"
             )
             # Don't fan out to a fallback bot after a failed MTProto send.
             # This prevents duplicate alerts during Telegram rate limiting.
@@ -3827,6 +3832,18 @@ async def main():
             print()
             print("=" * 90)
             print(f"📨 TELEGRAM {event_kind} — DIAGNOSTIC")
+            received_utc = now_utc()
+            message_date = getattr(event.message, "date", None)
+            if message_date is not None:
+                if message_date.tzinfo is None:
+                    message_date = message_date.replace(tzinfo=timezone.utc)
+                delivery_lag = (received_utc - message_date.astimezone(timezone.utc)).total_seconds()
+                print(f"Event callback received UTC: {received_utc.isoformat()}")
+                print(f"Telegram message date UTC: {message_date.astimezone(timezone.utc).isoformat()}")
+                print(f"Message-to-callback lag seconds: {delivery_lag:.3f}")
+            else:
+                print(f"Event callback received UTC: {received_utc.isoformat()}")
+                print("Message-to-callback lag seconds: unavailable (no Telegram date)")
             print(f"Chat title: {chat_title}")
             print(f"Chat ID: {event_chat_id}")
             print(f"Configured Phase 4 ID: {PHASE4_OUTPUT_CHANNEL_ID}")
@@ -3843,10 +3860,12 @@ async def main():
                 return
 
             print("✅ MESSAGE IS FROM CONFIGURED PHASE 4 CHAT")
-            if event_kind == "NEW MESSAGE":
-                asyncio.create_task(handle_message(event))
-            else:
-                print("ℹ️ Edited message logged only; it will not trigger execution.")
+            # Process both new messages and edits. Phase 4 may publish a
+            # preliminary post and edit it into a complete parsed signal.
+            # Parser requirements and signal-ID duplicate/lifecycle protection
+            # remain active, so an edit cannot bypass validation or execute twice.
+            print(f"🧭 PHASE6_HANDLER_SCHEDULED event_kind={event_kind} message_id={getattr(event.message, 'id', 'UNKNOWN')} utc={now_utc().isoformat()}")
+            asyncio.create_task(handle_message(event))
         except Exception as error:
             print()
             print("❌ TELEGRAM EVENT DISPATCH ERROR:")
