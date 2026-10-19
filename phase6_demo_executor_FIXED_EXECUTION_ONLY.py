@@ -3060,7 +3060,20 @@ async def handle_message(
     event
 ):
 
+    handler_started_utc = now_utc()
     try:
+        event_message_date = getattr(event.message, "date", None)
+        if event_message_date is not None:
+            if event_message_date.tzinfo is None:
+                event_message_date = event_message_date.replace(tzinfo=timezone.utc)
+            print(
+                f"⏱️ PHASE6_HANDLER_START utc={handler_started_utc.isoformat()} "
+                f"message_date_utc={event_message_date.astimezone(timezone.utc).isoformat()} "
+                f"lag_seconds={(handler_started_utc - event_message_date.astimezone(timezone.utc)).total_seconds():.3f} "
+                f"message_id={getattr(event.message, 'id', 'UNKNOWN')}"
+            )
+        else:
+            print(f"⏱️ PHASE6_HANDLER_START utc={handler_started_utc.isoformat()} message_date=unavailable")
 
         chat_id = int(
             event.chat_id
