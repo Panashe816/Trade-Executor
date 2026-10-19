@@ -3119,17 +3119,28 @@ async def handle_message(
         )
 
         if not signal:
-            print()
-            print("❌ PHASE 6 COULD NOT READ THE PHASE 4 EXECUTION MESSAGE")
-            print("   The message was received, but read_phase4_execution_message() returned None.")
-            print("   No trade attempt was made.")
-            print("   Check that Phase 4 sent the expected execution fields.")
+            # Phase 4's private channel may contain status, diagnostic, or
+            # intermediate messages as well as completed execution signals.
+            # Ignore messages that do not contain the core signal fields;
+            # do not send a failure alert for expected non-signal traffic.
+            required_signal_labels = ("Signal ID:", "Direction:", "Entry:", "SL:")
+            has_core_signal_fields = all(
+                re.search(rf"(?im)^.*?{re.escape(label)}\\s*.+$", message_text)
+                for label in required_signal_labels
+            )
+            if not has_core_signal_fields:
+                print(
+                    f"ℹ️ PHASE6_IGNORED_NON_SIGNAL message_id={message_id} "
+                    f"reason=missing_core_execution_fields"
+                )
+                return
 
-            await send_notification(
-                "❌ PHASE 6 COULD NOT READ PHASE 4 MESSAGE\n\n"
-                f"Message ID: {message_id}\n"
-                "No trade attempt was made.\n"
-                "Reason: read_phase4_execution_message() returned None."
+            # If it looks like a signal but validation fails, leave a useful
+            # server-side diagnostic without repeatedly messaging the status
+            # channel. No trade is attempted.
+            print(
+                f"⚠️ PHASE6_REJECTED_SIGNAL_FORMAT message_id={message_id} "
+                f"reason=execution_fields_failed_validation; no trade attempted"
             )
             return
 
