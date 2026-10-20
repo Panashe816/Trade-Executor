@@ -327,11 +327,12 @@ def place_order(request: DemoOrderRequest, http_request: Request):
         # Use Phase 6's stable short marker directly when it fits MT5's comment limit.
         # Longer arbitrary request IDs use a deterministic hash to avoid truncation collisions.
         request_key = ("LIVE:" if live_mode else "DEMO:") + request.request_id
-        mode_tag = "L" if live_mode else "D"
-        if len(request.request_id) <= 29 and re.fullmatch(r"[A-Za-z0-9:_-]+", request.request_id):
-            comment_tag = f"{mode_tag}-{request.request_id}"
+        # Phase 6 embeds the mode into live markers while preserving existing demo markers.
+        # Keep the request marker intact so Phase 6 can reconcile MT5 positions by comment.
+        if len(request.request_id) <= 31 and re.fullmatch(r"[A-Za-z0-9:_-]+", request.request_id):
+            comment_tag = request.request_id
         else:
-            comment_tag = f"{mode_tag}-" + hashlib.sha256(request.request_id.encode("utf-8")).hexdigest()[:27]
+            comment_tag = "GR-" + hashlib.sha256(request.request_id.encode("utf-8")).hexdigest()[:27]
         previous = get_execution_request(request_key)
         if previous:
             if previous["state"] in ("CONFIRMED", "REJECTED") and previous.get("response_json"):
