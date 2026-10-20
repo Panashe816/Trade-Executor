@@ -1766,7 +1766,12 @@ def build_trade_identifiers(signal_id, position_number):
     """Return stable, MT5-comment-safe identifiers for one signal position."""
     import hashlib
 
-    raw = f"{signal_id}:{int(position_number)}"
+    # Preserve existing demo markers for compatibility; live markers are isolated.
+    raw = (
+        f"live:{signal_id}:{int(position_number)}"
+        if PHASE6_TRADING_MODE == "live"
+        else f"{signal_id}:{int(position_number)}"
+    )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
     marker = f"GR-{digest}"
     return marker, marker
