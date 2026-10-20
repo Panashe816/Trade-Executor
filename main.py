@@ -24,7 +24,8 @@ LIVE_ACCOUNT_SERVER = os.getenv("LIVE_ACCOUNT_SERVER", "").strip()
 TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 DEFAULT_SYMBOL = "XAUUSD_i"
 MAGIC = 816202610
-MAX_TEST_VOLUME = 0.01
+DEMO_VOLUME = 0.01
+LIVE_VOLUME = 0.1
 DB_PATH = os.getenv("EXECUTION_DB_PATH", "gold_robot_execution.sqlite3")
 
 if not API_KEY:
@@ -182,8 +183,8 @@ def require_live_trading():
     if not LIVE_ACCOUNT_LOGIN or not LIVE_ACCOUNT_SERVER:
         raise HTTPException(status_code=503, detail="Live account allowlist is not configured.")
     account = require_account()
-    if account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO:
-        raise HTTPException(status_code=403, detail="Refusing live execution: MT5 account is a demo account.")
+    if account.trade_mode != mt5.ACCOUNT_TRADE_MODE_REAL:
+        raise HTTPException(status_code=403, detail="Refusing live execution: MT5 account is not a verified real account.")
     if str(account.login) != LIVE_ACCOUNT_LOGIN or account.server != LIVE_ACCOUNT_SERVER:
         raise HTTPException(status_code=403, detail="Refusing live execution: MT5 account login/server does not match the configured allowlist.")
     if not account.trade_allowed:
@@ -325,11 +326,13 @@ def place_order(request: DemoOrderRequest, http_request: Request):
     with _request_lock:
         # Use Phase 6's stable short marker directly when it fits MT5's comment limit.
         # Longer arbitrary request IDs use a deterministic hash to avoid truncation collisions.
-        if len(request.request_id) <= 31 and re.fullmatch(r"[A-Za-z0-9:_-]+", request.request_id):
-            comment_tag = request.request_id
+        request_key = ("LIVE:" if live_mode else "DEMO:") + request.request_id
+        mode_tag = "L" if live_mode else "D"
+        if len(request.request_id) <= 29 and re.fullmatch(r"[A-Za-z0-9:_-]+", request.request_id):
+            comment_tag = f"{mode_tag}-{request.request_id}"
         else:
-            comment_tag = "GR-" + hashlib.sha256(request.request_id.encode("utf-8")).hexdigest()[:27]
-        previous = get_execution_request(request.request_id)
+            comment_tag = f"{mode_tag}-" + hashlib.sha256(request.request_id.encode("utf-8")).hexdigest()[:27]
+        previous = get_execution_request(request_key)
         if previous:
             if previous["state"] in ("CONFIRMED", "REJECTED") and previous.get("response_json"):
                 return {
@@ -356,7 +359,7 @@ def place_order(request: DemoOrderRequest, http_request: Request):
                     "reconciled": True,
                     "reconciliation_source": reconciled.get("source"),
                 }
-                save_execution_request(request.request_id, "CONFIRMED", previous["comment_tag"], response)
+                save_execution_request(request_key, "CONFIRMED", previous["comment_tag"], response)
                 return {"duplicate": True, "state": "CONFIRMED", "result": response}
             raise HTTPException(
                 status_code=409,
@@ -369,6 +372,7 @@ def place_order(request: DemoOrderRequest, http_request: Request):
             )
 
         account = require_live_trading() if live_mode else require_demo_trading()
+        volume = LIVE_VOLUME if live_mode else DEMO_VOLUME
 
         info = mt5.symbol_info(DEFAULT_SYMBOL)
         if info is None:
@@ -380,10 +384,10 @@ def place_order(request: DemoOrderRequest, http_request: Request):
         if not info.visible and not mt5.symbol_select(DEFAULT_SYMBOL, True):
             raise HTTPException(status_code=503, detail="Could not select gold symbol")
 
-        if info.volume_min > MAX_TEST_VOLUME or info.volume_step > MAX_TEST_VOLUME:
+        if info.volume_min > volume or info.volume_step > volume or abs((volume / info.volume_step) - round(volume / info.volume_step)) > 1e-8:
             raise HTTPException(
                 status_code=400,
-                detail="Broker does not support the fixed 0.01-lot test volume",
+                detail=f"Broker symbol volume constraints do not support the configured {volume}-lot {'live' if live_mode else 'demo'} volume",
             )
 
         tick = mt5.symbol_info_tick(DEFAULT_SYMBOL)
@@ -430,7 +434,7 @@ def place_order(request: DemoOrderRequest, http_request: Request):
         request_data = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": DEFAULT_SYMBOL,
-            "volume": MAX_TEST_VOLUME,
+            "volume": volume,
             "type": order_type,
             "price": price,
             "sl": sl,
@@ -460,10 +464,10 @@ def place_order(request: DemoOrderRequest, http_request: Request):
             )
 
         # Record intent before sending. A crash after this point blocks automatic resubmission.
-        save_execution_request(request.request_id, "PENDING", comment_tag)
+        save_execution_request(request_key, "PENDING", comment_tag)
         result = mt5.order_send(request_data)
         if result is None:
-            save_execution_request(request.request_id, "UNKNOWN", comment_tag)
+            save_execution_request(request_key, "UNKNOWN", comment_tag)
             raise HTTPException(
                 status_code=502,
                 detail=f"No MT5 execution response: {mt5.last_error()}. Check MT5 before retrying.",
@@ -473,7 +477,7 @@ def place_order(request: DemoOrderRequest, http_request: Request):
             "request_id": request.request_id,
             "symbol": DEFAULT_SYMBOL,
             "side": side,
-            "volume": MAX_TEST_VOLUME,
+            "volume": volume,
             "requested_price": price,
             "stop_loss": sl,
             "take_profit": tp,
@@ -499,7 +503,7 @@ def place_order(request: DemoOrderRequest, http_request: Request):
                 response["reconciled"] = True
         # Persist the final result so process restarts do not erase idempotency history.
         state = "CONFIRMED" if response["execution_accepted"] else "REJECTED"
-        save_execution_request(request.request_id, state, comment_tag, response)
+        save_execution_request(request_key, state, comment_tag, response)
         return response
 
 
