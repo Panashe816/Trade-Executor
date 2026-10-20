@@ -26,9 +26,10 @@ from telethon.sessions import StringSession
 #          ↓
 # LOCAL FASTAPI EXECUTION API
 #          ↓
-# MT5 DEMO ACCOUNT by default; live mode requires explicit configuration
+# MT5 account selected by PHASE6_TRADING_MODE
 #
-# Live mode remains blocked unless account allowlist and API live gate are enabled
+# DEMO is the safe default when PHASE6_TRADING_MODE is not set.
+# LIVE requires PHASE6_TRADING_MODE=live plus matching account allowlist and API live gate.
 #
 # ============================================================
 
@@ -103,10 +104,20 @@ SYMBOL = os.getenv(
     "XAUUSD_i"
 )
 
-# Demo remains the default. Live mode is opt-in and restricted to one configured account.
-PHASE6_TRADING_MODE = os.getenv("PHASE6_TRADING_MODE", "demo").strip().lower()
+# The effective Render environment variable is authoritative. Keep demo as a safe
+# default only when the variable is absent; never silently downgrade an invalid value.
+_raw_trading_mode = os.getenv("PHASE6_TRADING_MODE")
+PHASE6_TRADING_MODE = (_raw_trading_mode or "demo").strip().lower()
 if PHASE6_TRADING_MODE not in ("demo", "live"):
-    raise RuntimeError("PHASE6_TRADING_MODE must be 'demo' or 'live'.")
+    raise RuntimeError(
+        "PHASE6_TRADING_MODE must be exactly 'demo' or 'live'; "
+        f"received {PHASE6_TRADING_MODE!r}."
+    )
+if not _raw_trading_mode:
+    print(
+        "WARNING: PHASE6_TRADING_MODE is not set; falling back to DEMO mode. "
+        "Set it explicitly in Render Environment."
+    )
 
 EXPECTED_LIVE_ACCOUNT_LOGIN = os.getenv("LIVE_ACCOUNT_LOGIN", "").strip()
 EXPECTED_LIVE_ACCOUNT_SERVER = os.getenv("LIVE_ACCOUNT_SERVER", "").strip()
@@ -3587,6 +3598,11 @@ async def main():
     print(
         f"PHASE 6 - {PHASE6_TRADING_MODE.upper()} TELEGRAM → MT5 EXECUTOR"
     )
+    print(
+        f"Effective PHASE6_TRADING_MODE={PHASE6_TRADING_MODE!r}; "
+        f"live account allowlist configured="
+        f"{bool(EXPECTED_LIVE_ACCOUNT_LOGIN and EXPECTED_LIVE_ACCOUNT_SERVER)}"
+    )
 
     print(
         "=" * 70
@@ -3596,6 +3612,10 @@ async def main():
     print(
         f"⚠️ MODE: {PHASE6_TRADING_MODE.upper()}"
     )
+    if PHASE6_TRADING_MODE == "live":
+        print("⚠️ LIVE MODE SELECTED: real-money execution is possible if all account/API safeguards pass.")
+    else:
+        print("⚠️ DEMO-ONLY MODE: real-money execution is blocked.")
 
     print(
         f"Lot size per position: {LOT_SIZE}"
