@@ -13,7 +13,7 @@ from telethon.sessions import StringSession
 
 
 # ============================================================
-# PHASE 6 - DEMO TELEGRAM -> MT5 EXECUTOR
+# PHASE 6 - TELEGRAM -> MT5 EXECUTOR
 # ============================================================
 #
 # PHASE 4 PRIVATE OUTPUT CHANNEL
@@ -26,14 +26,23 @@ from telethon.sessions import StringSession
 #          ↓
 # LOCAL FASTAPI EXECUTION API
 #          ↓
-# MT5 DEMO ACCOUNT
+# MT5 ACCOUNT SELECTED BY PHASE6_TRADING_MODE
 #
-# NO LIVE ACCOUNT TRADING
+# LIVE MODE REQUIRES EXPLICIT ACCOUNT ALLOWLIST AND API LIVE GATE
 #
 # ============================================================
 
 
 load_dotenv()
+
+# Trading mode is explicitly selected by the Render environment.
+# Safe fallback is demo; live mode never bypasses account/API safeguards.
+PHASE6_TRADING_MODE = os.getenv("PHASE6_TRADING_MODE", "demo").strip().lower()
+if PHASE6_TRADING_MODE not in ("demo", "live"):
+    raise RuntimeError("PHASE6_TRADING_MODE must be exactly 'demo' or 'live'.")
+
+LIVE_ACCOUNT_LOGIN = os.getenv("LIVE_ACCOUNT_LOGIN", "").strip()
+LIVE_ACCOUNT_SERVER = os.getenv("LIVE_ACCOUNT_SERVER", "").strip()
 
 
 # ============================================================
@@ -106,9 +115,14 @@ SYMBOL = os.getenv(
 LOT_SIZE = float(
     os.getenv(
         "LOT_SIZE",
-        "0.01"
+        "0.1" if PHASE6_TRADING_MODE == "live" else "0.01"
     )
 )
+
+EXPECTED_LOT_SIZE = 0.1 if PHASE6_TRADING_MODE == "live" else 0.01
+ORDER_ENDPOINT = "/live/order" if PHASE6_TRADING_MODE == "live" else "/demo/order"
+MODE_LABEL = "LIVE" if PHASE6_TRADING_MODE == "live" else "DEMO"
+
 
 POSITIONS_PER_SIGNAL = 2
 
@@ -1191,9 +1205,18 @@ async def ensure_execution_api_connection(valid_until=None):
             health = await api_request("GET", "/health")
             if not health.get("mt5_connected") or not health.get("account_authenticated"):
                 raise RuntimeError(f"API/MT5 health check failed: {health}")
+            if PHASE6_TRADING_MODE == "live" and not health.get("live_trading_enabled"):
+                raise RuntimeError("Safety stop: execution API live trading is not enabled.")
             info = await api_request("GET", "/account")
-            if not info.get("is_demo"):
-                raise RuntimeError("Safety stop: local MT5 account is not demo.")
+            if PHASE6_TRADING_MODE == "live":
+                if info.get("is_demo") is not False:
+                    raise RuntimeError("Safety stop: configured live mode requires a real MT5 account.")
+                if not LIVE_ACCOUNT_LOGIN or not LIVE_ACCOUNT_SERVER:
+                    raise RuntimeError("Safety stop: LIVE_ACCOUNT_LOGIN and LIVE_ACCOUNT_SERVER must be configured.")
+                if str(info.get("login", "")) != LIVE_ACCOUNT_LOGIN or str(info.get("server", "")) != LIVE_ACCOUNT_SERVER:
+                    raise RuntimeError("Safety stop: MT5 login/server does not match the configured live-account allowlist.")
+            elif info.get("is_demo") is not True:
+                raise RuntimeError("Safety stop: demo mode requires a demo MT5 account.")
             await set_execution_api_connection_state("CONNECTED")
             return True
         except asyncio.CancelledError:
@@ -1519,7 +1542,7 @@ async def notify_signal_executed(
         )
 
     message = (
-        "✅ DEMO SIGNAL EXECUTED\n"
+        f"✅ {MODE_LABEL} SIGNAL EXECUTED\n"
         "\n"
         f"Channel: {signal['channel']}\n"
         f"Signal ID: {signal['signal_id']}\n"
@@ -1830,20 +1853,22 @@ async def execute_signal(
 
 
 async def _execute_signal_locked(signal, execution_price):
-    """Execute two fixed 0.01-lot demo positions through the local FastAPI API."""
+    """Execute two positions using the configured demo/live mode through the local FastAPI API."""
     direction = str(signal["direction"]).upper()
     positions = []
     tps = signal["execution_tp_numbers"][:POSITIONS_PER_SIGNAL]
     if len(tps) < POSITIONS_PER_SIGNAL:
         raise RuntimeError("Phase 4 did not provide enough execution TPs.")
-    if abs(float(LOT_SIZE)-0.01) > 1e-9:
-        raise RuntimeError("Phase 6 LOT_SIZE must be 0.01; the API enforces 0.01 lots.")
+    if abs(float(LOT_SIZE)-EXPECTED_LOT_SIZE) > 1e-9:
+        raise RuntimeError(
+            f"Phase 6 LOT_SIZE must be {EXPECTED_LOT_SIZE:.2f} for {MODE_LABEL} mode."
+        )
     for n, tp_number in enumerate(tps, start=1):
         tp_values = signal["execution_tps"]
         tp_key = str(tp_number)
         tp = float(tp_values[tp_key] if tp_key in tp_values else tp_values[tp_number])
         client_id, marker = build_trade_identifiers(signal["signal_id"], n)
-        print("\n" + "-"*70 + f"\n🚀 EXECUTING POSITION {n}\nDirection: {direction}\nSymbol: {SYMBOL}\nVolume: 0.01 (API fixed)\nSL: {signal['stoploss']}\nTP{tp_number}: {tp}")
+        print("\n" + "-"*70 + f"\n🚀 EXECUTING POSITION {n}\nMode: {MODE_LABEL}\nDirection: {direction}\nSymbol: {SYMBOL}\nVolume: {LOT_SIZE}\nSL: {signal['stoploss']}\nTP{tp_number}: {tp}")
         try:
             existing = await find_existing_signal_position(signal["signal_id"], n, client_id)
             if existing:
@@ -1855,7 +1880,7 @@ async def _execute_signal_locked(signal, execution_price):
         if not await ensure_execution_api_connection(signal.get("valid_until")):
             return False, positions, False
         try:
-            result = await asyncio.wait_for(api_request("POST", "/demo/order", payload={
+            result = await asyncio.wait_for(api_request("POST", ORDER_ENDPOINT, payload={
                 "request_id": marker, "side": direction,
                 "stop_loss": float(signal["stoploss"]), "take_profit": tp,
             }), timeout=API_REQUEST_TIMEOUT_SECONDS+3)
@@ -1925,7 +1950,7 @@ async def _execute_signal_locked(signal, execution_price):
         positions.append(rec)
         await send_notification("✅ POSITION EXECUTED THROUGH LOCAL MT5 API\n\n"
             f"Signal ID: {signal['signal_id']}\nPosition: {n}/{POSITIONS_PER_SIGNAL}\nTP{tp_number}: {tp}\n"
-            f"Position ID: {pid or 'Unknown'}\nVolume: 0.01 lot\nMode: DEMO ONLY")
+            f"Position ID: {pid or 'Unknown'}\nVolume: {LOT_SIZE} lot\nMode: {MODE_LABEL}")
     return len(positions) == POSITIONS_PER_SIGNAL, positions, False
 
 
@@ -2120,7 +2145,7 @@ async def wait_for_entry(
                     save_pending_signals()
 
                     await send_notification(
-                        "⚠️ PARTIAL DEMO EXECUTION - SIGNAL STILL PENDING\n\n"
+                        f"⚠️ PARTIAL {MODE_LABEL} EXECUTION - SIGNAL STILL PENDING\n\n"
                         f"Channel: {signal['channel']}\n"
                         f"Signal ID: {signal_id}\n"
                         f"Successful positions: {len(positions)}/{POSITIONS_PER_SIGNAL}\n"
@@ -3511,7 +3536,7 @@ def display_settings():
     )
 
     print(
-        "  • DEMO ONLY"
+        f"  • {MODE_LABEL} MODE"
     )
 
     print(
@@ -3566,7 +3591,7 @@ async def main():
     )
 
     print(
-        "PHASE 6 - DEMO TELEGRAM → MT5 EXECUTOR"
+        f"PHASE 6 - {MODE_LABEL} TELEGRAM → MT5 EXECUTOR"
     )
 
     print(
@@ -3575,11 +3600,11 @@ async def main():
 
     print()
     print(
-        "⚠️ DEMO-ONLY MODE"
+        f"⚠️ {MODE_LABEL}-MODE EXECUTION"
     )
 
     print(
-        "⚠️ NO LIVE ACCOUNT TRADING ALLOWED"
+        ("⚠️ REAL-MONEY TRADING IS POSSIBLE" if PHASE6_TRADING_MODE == "live" else "⚠️ NO LIVE ACCOUNT TRADING ALLOWED")
     )
 
     print()
@@ -3668,12 +3693,21 @@ async def main():
     health = await api_request("GET", "/health")
     if not health.get("mt5_connected") or not health.get("account_authenticated"):
         raise RuntimeError(f"Local API reports MT5 unavailable: {health}")
+    if PHASE6_TRADING_MODE == "live" and not health.get("live_trading_enabled"):
+        raise RuntimeError("SAFETY STOP: execution API live trading is not enabled.")
     account = await api_request("GET", "/account")
-    if not account.get("is_demo"):
-        raise RuntimeError("SAFETY STOP: local MT5 account is not a DEMO account.")
+    if PHASE6_TRADING_MODE == "live":
+        if account.get("is_demo") is not False:
+            raise RuntimeError("SAFETY STOP: live mode requires a real MT5 account.")
+        if not LIVE_ACCOUNT_LOGIN or not LIVE_ACCOUNT_SERVER:
+            raise RuntimeError("SAFETY STOP: LIVE_ACCOUNT_LOGIN and LIVE_ACCOUNT_SERVER are required.")
+        if str(account.get("login", "")) != LIVE_ACCOUNT_LOGIN or str(account.get("server", "")) != LIVE_ACCOUNT_SERVER:
+            raise RuntimeError("SAFETY STOP: MT5 login/server does not match the configured live-account allowlist.")
+    elif account.get("is_demo") is not True:
+        raise RuntimeError("SAFETY STOP: demo mode requires a demo MT5 account.")
     if not account.get("trade_allowed"):
         raise RuntimeError("SAFETY STOP: MT5 account trading is disabled.")
-    print(f"✅ Demo account confirmed: {account.get('company')} / {account.get('server')}")
+    print(f"✅ {MODE_LABEL} account confirmed: {account.get('company')} / {account.get('server')}")
     execution_api_connection_lock = asyncio.Lock()
     execution_api_operation_lock = asyncio.Lock()
     await set_execution_api_connection_state("CONNECTED")
@@ -3803,7 +3837,7 @@ async def main():
     )
 
     print(
-        "  • DEMO ONLY"
+        f"  • {MODE_LABEL} MODE"
     )
 
     # --------------------------------------------------------
@@ -4020,7 +4054,7 @@ async def main():
         )
 
     await send_notification(
-        "🟢 PHASE 6 DEMO EXECUTOR ONLINE\n\n"
+        f"🟢 PHASE 6 {MODE_LABEL} EXECUTOR ONLINE\n\n"
         f"Time: {format_cat_time(now_iso())}\n"
         f"Execution API connection: {execution_api_connection_state}\n"
         f"MT5 symbol: {SYMBOL}\n"
@@ -4029,7 +4063,7 @@ async def main():
         f"Phase 6 STATUS channel: {PHASE6_STATUS_CHAT_ID or 'NOT CONFIGURED'}\n"
         "Telegram listener: ACTIVE\n"
         "Detailed diagnostics: ACTIVE\n"
-        "⚠️ DEMO ONLY"
+        f"⚠️ {MODE_LABEL} MODE"
     )
 
     # --------------------------------------------------------
