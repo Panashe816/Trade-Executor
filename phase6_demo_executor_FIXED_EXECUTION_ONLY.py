@@ -124,7 +124,7 @@ ORDER_ENDPOINT = "/live/order" if PHASE6_TRADING_MODE == "live" else "/demo/orde
 MODE_LABEL = "LIVE" if PHASE6_TRADING_MODE == "live" else "DEMO"
 
 
-POSITIONS_PER_SIGNAL = 2
+POSITIONS_PER_SIGNAL = 3
 
 
 # ============================================================
@@ -1088,7 +1088,8 @@ def read_phase4_execution_message(message, chat_id, message_id):
 
     valid_until = signal_time + timedelta(hours=2)
 
-    # Read the execution targets selected by Phase 4.
+    # Read Phase 4 execution targets first, then apply the two approved
+    # source-specific overrides. Other sources keep Phase 4's supplied targets.
     execution_numbers = []
     execution_tps = {}
 
@@ -1112,19 +1113,51 @@ def read_phase4_execution_message(message, chat_id, message_id):
             r"(\d+(?:\.\d+)?)\s*$"
         )
         for match in fallback_pattern.finditer(text):
+            position_number = int(match.group(1))
             tp_number = int(match.group(2))
             if tp_number not in execution_tps:
                 execution_numbers.append(tp_number)
                 execution_tps[tp_number] = float(match.group(3))
 
-    if len(execution_numbers) < POSITIONS_PER_SIGNAL:
-        return None
+    normalized_channel = re.sub(r"[^A-Z0-9]+", " ", channel.upper()).strip()
+    is_trading_view = "TRADING VIEW" in normalized_channel
+    is_king_xauusd = "KING OF XAUUSD" in normalized_channel
 
-    # Keep the first target for each position in Phase 4 order.
-    ordered_numbers = []
-    for number in execution_numbers:
-        if number not in ordered_numbers:
-            ordered_numbers.append(number)
+    if is_trading_view or is_king_xauusd:
+        required_tp = 8 if is_trading_view else 5
+        fallback_tp = 7 if is_trading_view else None
+
+        # Use TP8 by default for Trading View; only fall back to TP7 when
+        # TP8 is absent. KING OF XAUUSD always requires TP5.
+        selected_tp = required_tp
+        selected_price = None
+        if required_tp in execution_tps:
+            selected_price = execution_tps[required_tp]
+        elif fallback_tp is not None and fallback_tp in execution_tps:
+            selected_tp = fallback_tp
+            selected_price = execution_tps[fallback_tp]
+
+        if selected_price is None:
+            print(
+                f"⚠️ Required execution target TP{required_tp}"
+                + (f" (fallback TP{fallback_tp})" if fallback_tp else "")
+                + f" was not present for {channel!r}; no trade will be attempted."
+            )
+            return None
+
+        execution_numbers = [selected_tp] * POSITIONS_PER_SIGNAL
+        # Store the selected TP price under this selected target number only.
+        execution_tps = {selected_tp: float(selected_price)}
+    else:
+        # Preserve existing behaviour for all other channels: they must provide
+        # a separate Phase 4 execution TP for every configured position.
+        ordered_numbers = []
+        for number in execution_numbers:
+            if number not in ordered_numbers:
+                ordered_numbers.append(number)
+        execution_numbers = ordered_numbers[:POSITIONS_PER_SIGNAL]
+        if len(execution_numbers) < POSITIONS_PER_SIGNAL:
+            return None
 
     return {
         "channel": channel,
@@ -1138,7 +1171,7 @@ def read_phase4_execution_message(message, chat_id, message_id):
         "entry_high": entry_high,
         "stoploss": stoploss,
         "tp_levels": dict(execution_tps),
-        "execution_tp_numbers": ordered_numbers[:POSITIONS_PER_SIGNAL],
+        "execution_tp_numbers": execution_numbers,
         "execution_tps": execution_tps,
         "parse_success": True,
         "validation_errors": [],
@@ -3808,11 +3841,7 @@ async def main():
     )
 
     print(
-        "  • Position 1: TP supplied by Phase 4"
-    )
-
-    print(
-        "  • Position 2: TP supplied by Phase 4"
+        "  • Positions 1–3: TP supplied by Phase 4 or source-specific override"
     )
 
     print(
