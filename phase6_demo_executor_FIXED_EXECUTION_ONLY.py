@@ -1282,7 +1282,7 @@ async def execution_api_connection_monitor():
 
 async def verify_symbol():
     quote = await api_request("GET", f"/symbols/{SYMBOL}/quote")
-    print(f"✅ {SYMBOL} available through local MT5 API; digits={quote.get('digits')}; API volume fixed at 0.01")
+    print(f"✅ {SYMBOL} available through local MT5 API; digits={quote.get('digits')}; order volume selected by Phase 6 mode ({MODE_LABEL})")
     return quote
 
 
@@ -3722,30 +3722,34 @@ async def main():
     # ========================================================
     print("\n" + "="*70 + "\nCONNECTING TO LOCAL FASTAPI -> MT5\n" + "="*70)
     print(f"API URL: {EXECUTION_API_URL}\nAPI key: configured (hidden)")
-    api_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_REQUEST_TIMEOUT_SECONDS))
-    health = await api_request("GET", "/health")
-    if not health.get("mt5_connected") or not health.get("account_authenticated"):
-        raise RuntimeError(f"Local API reports MT5 unavailable: {health}")
-    if PHASE6_TRADING_MODE == "live" and not health.get("live_trading_enabled"):
-        raise RuntimeError("SAFETY STOP: execution API live trading is not enabled.")
-    account = await api_request("GET", "/account")
-    if PHASE6_TRADING_MODE == "live":
-        if account.get("is_demo") is not False:
-            raise RuntimeError("SAFETY STOP: live mode requires a real MT5 account.")
-        if not LIVE_ACCOUNT_LOGIN or not LIVE_ACCOUNT_SERVER:
-            raise RuntimeError("SAFETY STOP: LIVE_ACCOUNT_LOGIN and LIVE_ACCOUNT_SERVER are required.")
-        if str(account.get("login", "")) != LIVE_ACCOUNT_LOGIN or str(account.get("server", "")) != LIVE_ACCOUNT_SERVER:
-            raise RuntimeError("SAFETY STOP: MT5 login/server does not match the configured live-account allowlist.")
-    elif account.get("is_demo") is not True:
-        raise RuntimeError("SAFETY STOP: demo mode requires a demo MT5 account.")
-    if not account.get("trade_allowed"):
-        raise RuntimeError("SAFETY STOP: MT5 account trading is disabled.")
-    print(f"✅ {MODE_LABEL} account confirmed: {account.get('company')} / {account.get('server')}")
-    execution_api_connection_lock = asyncio.Lock()
-    execution_api_operation_lock = asyncio.Lock()
-    await set_execution_api_connection_state("CONNECTED")
-    await verify_symbol()
 
+    # Startup health/account checks are safe reads. Reuse the connection
+    # recovery loop so temporary Cloudflare 502/503/504 errors do not crash
+    # Phase 6 immediately. Order POSTs are deliberately not auto-retried.
+    api_session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=API_REQUEST_TIMEOUT_SECONDS)
+    )
+    try:
+        connected = await ensure_execution_api_connection()
+        if not connected:
+            raise RuntimeError("Execution API startup verification did not complete.")
+
+        # Keep the explicit trade_allowed startup check.
+        account = await api_request("GET", "/account")
+        if not account.get("trade_allowed"):
+            raise RuntimeError("SAFETY STOP: MT5 account trading is disabled.")
+
+        print(f"✅ {MODE_LABEL} account confirmed: {account.get('company')} / {account.get('server')}")
+        execution_api_connection_lock = asyncio.Lock()
+        execution_api_operation_lock = asyncio.Lock()
+        await verify_symbol()
+    except BaseException:
+        # No Telegram trading listener has been registered at this point.
+        # Close resources on startup failure or cancellation.
+        if api_session is not None and not api_session.closed:
+            await api_session.close()
+        api_session = None
+        raise
 
 
     # ========================================================
