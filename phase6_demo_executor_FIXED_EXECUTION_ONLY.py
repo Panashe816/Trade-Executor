@@ -1122,13 +1122,16 @@ def read_phase4_execution_message(message, chat_id, message_id):
     normalized_channel = re.sub(r"[^A-Z0-9]+", " ", channel.upper()).strip()
     is_trading_view = "TRADING VIEW" in normalized_channel
     is_king_xauusd = "KING OF XAUUSD" in normalized_channel
+    is_guns_the_trader = "GUNS THE TRADER" in normalized_channel
 
-    if is_trading_view or is_king_xauusd:
-        required_tp = 8 if is_trading_view else 5
+    if is_trading_view or is_king_xauusd or is_guns_the_trader:
+        # Source-specific target policies:
+        # Trading View: all positions use TP8, falling back to TP7.
+        # KING OF XAUUSD: all positions use TP5.
+        # GUNS THE TRADER: all positions use TP4.
+        required_tp = 8 if is_trading_view else (5 if is_king_xauusd else 4)
         fallback_tp = 7 if is_trading_view else None
 
-        # Use TP8 by default for Trading View; only fall back to TP7 when
-        # TP8 is absent. KING OF XAUUSD always requires TP5.
         selected_tp = required_tp
         selected_price = None
         if required_tp in execution_tps:
@@ -3183,7 +3186,10 @@ async def handle_message(
             # do not send a failure alert for expected non-signal traffic.
             required_signal_labels = ("Signal ID:", "Direction:", "Entry:", "SL:")
             has_core_signal_fields = all(
-                re.search(rf"(?im)^.*?{re.escape(label)}\\s*.+$", message_text)
+                re.search(
+                    rf"(?im)^.*?{re.escape(label)}\\s*.+$".replace("\\\\s", "\\s"),
+                    message_text,
+                )
                 for label in required_signal_labels
             )
             if not has_core_signal_fields:
