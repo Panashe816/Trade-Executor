@@ -3187,7 +3187,7 @@ async def handle_message(
             required_signal_labels = ("Signal ID:", "Direction:", "Entry:", "SL:")
             has_core_signal_fields = all(
                 re.search(
-                    rf"(?im)^.*?{re.escape(label)}\\s*.+$".replace("\\\\s", "\\s"),
+                    rf"(?im)^.*?{re.escape(label)}\\s*.+$",
                     message_text,
                 )
                 for label in required_signal_labels
