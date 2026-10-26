@@ -1051,6 +1051,11 @@ def read_phase4_execution_message(message, chat_id, message_id):
     signal_time_value = label("Signal Time")
     valid_until_value = label("Valid Until")
     channel = label("Channel") or "Unknown"
+    source_channel_id_value = label("Source Channel ID")
+    try:
+        source_channel_id = int(source_channel_id_value) if source_channel_id_value else None
+    except (TypeError, ValueError):
+        source_channel_id = None
 
     if not signal_id or not direction or not entry_value or not sl_value:
         return None
@@ -1119,18 +1124,19 @@ def read_phase4_execution_message(message, chat_id, message_id):
                 execution_numbers.append(tp_number)
                 execution_tps[tp_number] = float(match.group(3))
 
-    normalized_channel = re.sub(r"[^A-Z0-9]+", " ", channel.upper()).strip()
-    is_trading_view = "TRADING VIEW" in normalized_channel
-    is_king_xauusd = "KING OF XAUUSD" in normalized_channel
-    is_guns_the_trader = "GUNS THE TRADER" in normalized_channel
+    # Source execution policy is selected by the original Telegram source ID.
+    # These IDs must match SOURCE_CHANNELS / TP_MAPPING in Phase 4.
+    # Names are diagnostic only and are not used to select the source policy.
+    source_tp_policy = {
+        -1001685029638: {"name": "Trading View", "tp": 8, "fallback": 7},
+        -1001303958625: {"name": "KING OF XAUUSD", "tp": 5, "fallback": None},
+        -1003170522699: {"name": "GUNS THE TRADER", "tp": 4, "fallback": None},
+    }
+    source_policy = source_tp_policy.get(source_channel_id)
 
-    if is_trading_view or is_king_xauusd or is_guns_the_trader:
-        # Source-specific target policies:
-        # Trading View: all positions use TP8, falling back to TP7.
-        # KING OF XAUUSD: all positions use TP5.
-        # GUNS THE TRADER: all positions use TP4.
-        required_tp = 8 if is_trading_view else (5 if is_king_xauusd else 4)
-        fallback_tp = 7 if is_trading_view else None
+    if source_policy is not None:
+        required_tp = source_policy["tp"]
+        fallback_tp = source_policy["fallback"]
 
         selected_tp = required_tp
         selected_price = None
@@ -3187,7 +3193,7 @@ async def handle_message(
             required_signal_labels = ("Signal ID:", "Direction:", "Entry:", "SL:")
             has_core_signal_fields = all(
                 re.search(
-                    rf"(?im)^.*?{re.escape(label)}\\s*.+$",
+                    rf"(?im)^.*?{re.escape(label)}\s*.+$",
                     message_text,
                 )
                 for label in required_signal_labels
