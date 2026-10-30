@@ -115,11 +115,11 @@ SYMBOL = os.getenv(
 LOT_SIZE = float(
     os.getenv(
         "LOT_SIZE",
-        "0.1" if PHASE6_TRADING_MODE == "live" else "0.01"
+        "0.4" if PHASE6_TRADING_MODE == "live" else "0.01"
     )
 )
 
-EXPECTED_LOT_SIZE = 0.1 if PHASE6_TRADING_MODE == "live" else 0.01
+EXPECTED_LOT_SIZE = 0.4 if PHASE6_TRADING_MODE == "live" else 0.01
 ORDER_ENDPOINT = "/live/order" if PHASE6_TRADING_MODE == "live" else "/demo/order"
 MODE_LABEL = "LIVE" if PHASE6_TRADING_MODE == "live" else "DEMO"
 
