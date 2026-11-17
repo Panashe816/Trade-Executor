@@ -124,7 +124,7 @@ ORDER_ENDPOINT = "/live/order" if PHASE6_TRADING_MODE == "live" else "/demo/orde
 MODE_LABEL = "LIVE" if PHASE6_TRADING_MODE == "live" else "DEMO"
 
 
-POSITIONS_PER_SIGNAL = 3
+POSITIONS_PER_SIGNAL = 1
 
 
 # ============================================================
@@ -1093,8 +1093,8 @@ def read_phase4_execution_message(message, chat_id, message_id):
 
     valid_until = signal_time + timedelta(hours=2)
 
-    # Read Phase 4 execution targets first, then apply the two approved
-    # source-specific overrides. Other sources keep Phase 4's supplied targets.
+    # Read the single Phase 4 execution target, then apply the approved
+    # source-specific TP policies. Other sources keep Phase 4's supplied target.
     execution_numbers = []
     execution_tps = {}
     execution_target_records = []
@@ -1137,10 +1137,13 @@ def read_phase4_execution_message(message, chat_id, message_id):
     source_policy = source_tp_policy.get(source_channel_id)
 
     if source_channel_id == -1003737121071:
-        # Trading Master intentionally sends the same selected TP to both
-        # execution positions. Preserve both slots; do not deduplicate them.
-        # Phase 4 has already applied TP6 -> TP5 -> TP4 priority.
-        if len(execution_target_records) != POSITIONS_PER_SIGNAL:
+        # Trading Master sends one execution target: TP6, falling back to
+        # TP5 and then TP4. Phase 4 selects and emits exactly one target.
+        if len(execution_target_records) != 1:
+            print(
+                f"⚠️ Invalid Trading Master execution targets for {channel!r}; "
+                "exactly one position using the selected TP6/TP5/TP4 is required."
+            )
             return None
 
         position_numbers = [record[0] for record in execution_target_records]
@@ -1148,20 +1151,18 @@ def read_phase4_execution_message(message, chat_id, message_id):
         tp_prices = [record[2] for record in execution_target_records]
 
         if (
-            set(position_numbers) != {1, 2}
-            or len(set(tp_numbers)) != 1
+            position_numbers != [1]
             or tp_numbers[0] not in (4, 5, 6)
-            or len(set(tp_prices)) != 1
         ):
             print(
-                f"⚠️ Invalid Trading Master execution targets for {channel!r}; "
-                "two positions must carry the same TP4, TP5, or TP6 price."
+                f"⚠️ Invalid Trading Master execution target for {channel!r}; "
+                "Position 1 must use TP6, TP5, or TP4 fallback."
             )
             return None
 
         selected_tp = tp_numbers[0]
         selected_price = float(tp_prices[0])
-        execution_numbers = [selected_tp] * POSITIONS_PER_SIGNAL
+        execution_numbers = [selected_tp]
         execution_tps = {selected_tp: selected_price}
 
     elif source_policy is not None:
@@ -1845,7 +1846,7 @@ async def notify_position_closed(
 
 
 # ============================================================
-# EXECUTE TWO POSITIONS
+# EXECUTE ONE POSITION
 # ============================================================
 
 def build_trade_identifiers(signal_id, position_number):
@@ -1925,7 +1926,7 @@ async def execute_signal(
 
 
 async def _execute_signal_locked(signal, execution_price):
-    """Execute two positions using the configured demo/live mode through the local FastAPI API."""
+    """Execute one position using the configured demo/live mode through the local FastAPI API."""
     direction = str(signal["direction"]).upper()
     positions = []
     tps = signal["execution_tp_numbers"][:POSITIONS_PER_SIGNAL]
@@ -3887,7 +3888,7 @@ async def main():
     )
 
     print(
-        "  • Positions 1–3: TP supplied by Phase 4 or source-specific override"
+        "  • One position per signal: selected TP supplied by Phase 4 or source-specific override"
     )
 
     print(
