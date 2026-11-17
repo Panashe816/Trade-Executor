@@ -1097,6 +1097,7 @@ def read_phase4_execution_message(message, chat_id, message_id):
     # source-specific overrides. Other sources keep Phase 4's supplied targets.
     execution_numbers = []
     execution_tps = {}
+    execution_target_records = []
 
     target_pattern = re.compile(
         r"(?im)^\s*Position\s*([1-9]|1[0-9])\s*(?:→|->|=>|:|-)\s*"
@@ -1109,6 +1110,7 @@ def read_phase4_execution_message(message, chat_id, message_id):
         tp_price = float(match.group(3))
         execution_numbers.append(tp_number)
         execution_tps[tp_number] = tp_price
+        execution_target_records.append((position_number, tp_number, tp_price))
 
     # Fallback for a Phase 4 message using a simpler target separator.
     if len(execution_numbers) < POSITIONS_PER_SIGNAL:
@@ -1134,7 +1136,35 @@ def read_phase4_execution_message(message, chat_id, message_id):
     }
     source_policy = source_tp_policy.get(source_channel_id)
 
-    if source_policy is not None:
+    if source_channel_id == -1003737121071:
+        # Trading Master intentionally sends the same selected TP to both
+        # execution positions. Preserve both slots; do not deduplicate them.
+        # Phase 4 has already applied TP6 -> TP5 -> TP4 priority.
+        if len(execution_target_records) != POSITIONS_PER_SIGNAL:
+            return None
+
+        position_numbers = [record[0] for record in execution_target_records]
+        tp_numbers = [record[1] for record in execution_target_records]
+        tp_prices = [record[2] for record in execution_target_records]
+
+        if (
+            set(position_numbers) != {1, 2}
+            or len(set(tp_numbers)) != 1
+            or tp_numbers[0] not in (4, 5, 6)
+            or len(set(tp_prices)) != 1
+        ):
+            print(
+                f"⚠️ Invalid Trading Master execution targets for {channel!r}; "
+                "two positions must carry the same TP4, TP5, or TP6 price."
+            )
+            return None
+
+        selected_tp = tp_numbers[0]
+        selected_price = float(tp_prices[0])
+        execution_numbers = [selected_tp] * POSITIONS_PER_SIGNAL
+        execution_tps = {selected_tp: selected_price}
+
+    elif source_policy is not None:
         required_tp = source_policy["tp"]
         fallback_tp = source_policy["fallback"]
 
