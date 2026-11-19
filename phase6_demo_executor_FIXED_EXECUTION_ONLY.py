@@ -1057,6 +1057,17 @@ def read_phase4_execution_message(message, chat_id, message_id):
     except (TypeError, ValueError):
         source_channel_id = None
 
+    # TEMPORARY SOURCE ALLOWLIST: only Trading Master and KING OF XAUUSD
+    # may pass through to execution. All other Phase 4 sources are ignored.
+    allowed_source_channels = {-1003737121071, -1001303958625}
+    if source_channel_id not in allowed_source_channels:
+        print(
+            f"🚫 Ignoring signal from disabled source {channel!r} "
+            f"(source_channel_id={source_channel_id}); "
+            "only Trading Master and KING OF XAUUSD are enabled."
+        )
+        return None
+
     if not signal_id or not direction or not entry_value or not sl_value:
         return None
 
@@ -1130,9 +1141,7 @@ def read_phase4_execution_message(message, chat_id, message_id):
     # These IDs must match SOURCE_CHANNELS / TP_MAPPING in Phase 4.
     # Names are diagnostic only and are not used to select the source policy.
     source_tp_policy = {
-        -1001685029638: {"name": "Trading View", "tp": 8, "fallback": 7},
         -1001303958625: {"name": "KING OF XAUUSD", "tp": 5, "fallback": None},
-        -1003170522699: {"name": "GUNS THE TRADER", "tp": 4, "fallback": None},
     }
     source_policy = source_tp_policy.get(source_channel_id)
 
