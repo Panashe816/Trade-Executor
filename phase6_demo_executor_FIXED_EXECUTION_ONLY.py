@@ -1140,9 +1140,7 @@ def read_phase4_execution_message(message, chat_id, message_id):
     # Source execution policy is selected by the original Telegram source ID.
     # These IDs must match SOURCE_CHANNELS / TP_MAPPING in Phase 4.
     # Names are diagnostic only and are not used to select the source policy.
-    source_tp_policy = {
-        -1001303958625: {"name": "KING OF XAUUSD", "tp": 5, "fallback": None},
-    }
+    source_tp_policy = {}
     source_policy = source_tp_policy.get(source_channel_id)
 
     if source_channel_id == -1003737121071:
@@ -1173,6 +1171,27 @@ def read_phase4_execution_message(message, chat_id, message_id):
         selected_price = float(tp_prices[0])
         execution_numbers = [selected_tp]
         execution_tps = {selected_tp: selected_price}
+
+    elif source_channel_id == -1001303958625:
+        # KING OF XAUUSD follows Phase 4: TP6, falling back to TP5, then TP4.
+        # Validate the single target Phase 4 selected instead of requiring TP5.
+        if len(execution_target_records) != 1:
+            print(
+                f"⚠️ Invalid KING OF XAUUSD execution targets for {channel!r}; "
+                "exactly one position using the selected TP6/TP5/TP4 is required."
+            )
+            return None
+
+        position_number, selected_tp, selected_price = execution_target_records[0]
+        if position_number != 1 or selected_tp not in (4, 5, 6):
+            print(
+                f"⚠️ Invalid KING OF XAUUSD execution target for {channel!r}; "
+                "Position 1 must use TP6, TP5, or TP4 fallback."
+            )
+            return None
+
+        execution_numbers = [selected_tp] * POSITIONS_PER_SIGNAL
+        execution_tps = {selected_tp: float(selected_price)}
 
     elif source_policy is not None:
         required_tp = source_policy["tp"]
