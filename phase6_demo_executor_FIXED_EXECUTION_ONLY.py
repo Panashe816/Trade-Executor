@@ -1961,6 +1961,29 @@ async def _execute_signal_locked(signal, execution_price):
             return False, positions, False
         if not await ensure_execution_api_connection(signal.get("valid_until")):
             return False, positions, False
+
+        # Recheck the live quote immediately before every NEW order submission.
+        # This is deliberately after existing-position reconciliation so an
+        # already-accepted order is recognised rather than duplicated.
+        fresh_quote = await get_current_price_with_recovery(signal.get("valid_until"))
+        if fresh_quote is None:
+            print(f"🛑 ORDER BLOCKED — no fresh quote available for {signal['signal_id']}.")
+            return False, positions, False
+        fresh_bid, fresh_ask = fresh_quote
+        fresh_execution_price = fresh_bid if direction == "SELL" else fresh_ask
+        allowed_low, allowed_high = calculate_extended_range(
+            direction,
+            float(signal["entry_low"]),
+            float(signal["entry_high"])
+        )
+        if not (allowed_low <= fresh_execution_price <= allowed_high):
+            print(
+                f"🛑 ORDER BLOCKED — live price {fresh_execution_price:.3f} "
+                f"is outside permitted range {allowed_low:.3f}-{allowed_high:.3f} "
+                f"for {signal['signal_id']}."
+            )
+            return False, positions, False
+
         try:
             result = await asyncio.wait_for(api_request("POST", ORDER_ENDPOINT, payload={
                 "request_id": marker, "side": direction,
@@ -2168,6 +2191,23 @@ async def wait_for_entry(
                 execution_price = (
                     bid if signal["direction"] == "SELL" else ask
                 )
+
+                # A latched trigger records that the range was reached previously;
+                # it does not authorise a new order at a later out-of-range price.
+                extended_low, extended_high = calculate_extended_range(
+                    signal["direction"],
+                    signal["entry_low"],
+                    signal["entry_high"]
+                )
+                if not (extended_low <= execution_price <= extended_high):
+                    print()
+                    print("🛑 EXECUTION PAUSED — PRICE OUTSIDE ENTRY RANGE")
+                    print(f"   Signal ID: {signal_id}")
+                    print(f"   Current execution price: {execution_price:.3f}")
+                    print(f"   Required range: {extended_low:.3f} - {extended_high:.3f}")
+                    print("   Decision: do not submit an order; keep signal pending and wait for re-entry.")
+                    await asyncio.sleep(PRICE_CHECK_INTERVAL_SECONDS)
+                    continue
 
                 print()
                 print("🚀 STARTING TRADE EXECUTION")
