@@ -1057,14 +1057,15 @@ def read_phase4_execution_message(message, chat_id, message_id):
     except (TypeError, ValueError):
         source_channel_id = None
 
-    # TEMPORARY SOURCE ALLOWLIST: only Trading Master and KING OF XAUUSD
-    # may pass through to execution. All other Phase 4 sources are ignored.
-    allowed_source_channels = {-1003737121071, -1001303958625}
+    # ACTIVE SOURCE ALLOWLIST: only Trading Master may pass through
+    # to execution. Other sources remain filtered; their handling code
+    # is retained below for possible future reactivation.
+    allowed_source_channels = {-1003737121071}
     if source_channel_id not in allowed_source_channels:
         print(
             f"🚫 Ignoring signal from disabled source {channel!r} "
             f"(source_channel_id={source_channel_id}); "
-            "only Trading Master and KING OF XAUUSD are enabled."
+            "only Trading Master is enabled."
         )
         return None
 
