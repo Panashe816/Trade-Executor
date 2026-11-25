@@ -1057,15 +1057,17 @@ def read_phase4_execution_message(message, chat_id, message_id):
     except (TypeError, ValueError):
         source_channel_id = None
 
-    # ACTIVE SOURCE ALLOWLIST: only Trading Master may pass through
-    # to execution. Other sources remain filtered; their handling code
-    # is retained below for possible future reactivation.
-    allowed_source_channels = {-1003737121071}
+    # ACTIVE SOURCE ALLOWLIST: Trading Master and Trading View may pass
+    # through to execution. All other original signal sources remain filtered.
+    allowed_source_channels = {
+        -1003737121071,  # Trading Master
+        -1001685029638,  # Trading View
+    }
     if source_channel_id not in allowed_source_channels:
         print(
             f"🚫 Ignoring signal from disabled source {channel!r} "
             f"(source_channel_id={source_channel_id}); "
-            "only Trading Master is enabled."
+            "only Trading Master and Trading View are enabled."
         )
         return None
 
