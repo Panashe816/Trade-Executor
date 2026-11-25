@@ -742,6 +742,36 @@ def save_lifecycle():
 
 
 # ============================================================
+# ONE-TIME TARGETED PENDING SIGNAL CANCELLATION
+# ============================================================
+
+def cancel_targeted_pending_signal():
+
+    signal_id = "SIG-1003737121071-4498"
+
+    if signal_id in executed_signals:
+        print(f"⚠️ Cancellation skipped: {signal_id} is already recorded as executed.")
+        return
+
+    signal = pending_signals.get(signal_id) or lifecycle_signals.get(signal_id) or {
+        "signal_id": signal_id
+    }
+
+    signal["status"] = "CANCELLED"
+    signal["cancelled_at"] = now_iso()
+    signal["cancellation_reason"] = "Manually cancelled at user request; duplicate/stale Trading Master signal."
+
+    pending_signals.pop(signal_id, None)
+    lifecycle_signals[signal_id] = signal
+
+    save_pending_signals()
+    save_lifecycle()
+
+    print(f"🛑 TARGETED SIGNAL CANCELLATION APPLIED: {signal_id}")
+    print("   Signal removed from pending queue and protected by lifecycle status CANCELLED.")
+
+
+# ============================================================
 # PHASE 4 OUTPUT PARSER
 # ============================================================
 #
@@ -3830,6 +3860,10 @@ async def main():
     # --------------------------------------------------------
 
     load_runtime_memory()
+
+    # Cancel only the specifically identified stale Trading Master signal
+    # before pending signals are resumed. All other pending signals remain intact.
+    cancel_targeted_pending_signal()
 
     # ========================================================
     # LOCAL FASTAPI / MT5 CONNECTION
